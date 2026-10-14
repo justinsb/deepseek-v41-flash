@@ -148,10 +148,12 @@ class NgramHashState(nn.Module):
         flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
         offsets = [np.cumsum([0, *sizes[:-1]]) for sizes in flat]
         multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size)
-        self.register_buffer("primes", torch.tensor(layout.primes), persistent=False)
-        self.register_buffer("offsets", torch.tensor(np.array(offsets)), persistent=False)
-        self.register_buffer("multipliers", multipliers, persistent=False)
-        self.register_buffer("token_map", torch.tensor(token_map), persistent=False)
+        # vxpu: constants are built on the CPU explicitly so that a model constructed on the meta
+        # device (for a weightless export) still carries their values; they move with the module
+        self.register_buffer("primes", torch.tensor(layout.primes, device="cpu"), persistent=False)
+        self.register_buffer("offsets", torch.tensor(np.array(offsets), device="cpu"), persistent=False)
+        self.register_buffer("multipliers", multipliers.to("cpu"), persistent=False)
+        self.register_buffer("token_map", torch.tensor(token_map, device="cpu"), persistent=False)
         self.register_buffer(
             "cache", torch.empty(args.max_batch_size, args.max_seq_len, dtype=torch.int64), persistent=False
         )

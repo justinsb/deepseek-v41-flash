@@ -378,7 +378,9 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     training context keep their frequency, those far beyond it are divided by `factor`, and the
     `beta_fast`..`beta_slow` band in between is faded across with a linear ramp.
     """
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    # vxpu: computed on the CPU explicitly, so that a model built on the meta device (for a
+    # weightless export) still carries the real table; it moves with the module afterwards
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim))
     if original_seq_len > 0:
         # the dim whose wavelength completes `rotations` turns over the training context
         def corrected_dim(rotations):
@@ -386,11 +388,11 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
 
         low = max(math.floor(corrected_dim(beta_fast)), 0)
         high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
-        ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / max(high - low, 1e-3)).clamp(0, 1)
+        ramp = ((torch.arange(dim // 2, dtype=torch.float32, device="cpu") - low) / max(high - low, 1e-3)).clamp(0, 1)
         smooth = 1 - ramp
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    freqs = torch.outer(torch.arange(seqlen), freqs)
+    freqs = torch.outer(torch.arange(seqlen, device="cpu"), freqs)
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
@@ -410,6 +412,16 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     y.copy_(x)
     return y
 
+
+
+def _dequantized(weight: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
+    """A Linear's weight as bf16: fp8 with 32x32 block scales expanded (exact), bf16 as is."""
+    if weight.dtype != torch.float8_e4m3fn:
+        return weight
+    out, inn = weight.shape
+    bs = fp8_block_size
+    blocks = weight.to(torch.bfloat16).view(out // bs, bs, inn // bs, bs)
+    return (blocks * scale.to(torch.bfloat16).view(out // bs, 1, inn // bs, 1)).view(out, inn)
 
 
 def _with_rotated_tail(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int) -> torch.Tensor:
@@ -693,10 +705,12 @@ class Attention(nn.Module):
         self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim)
         self.wkv = Linear(self.dim, self.head_dim)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        # vxpu: kept in the checkpoint's dtype (fp8 with block scales) and dequantized where it
+        # is used; the published runner had convert.py write a bf16 copy, which is the same
+        # numbers (fp8 x power-of-two scale is exact in bf16)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * args.o_lora_rank,
-            dtype=torch.bfloat16,
         )
         self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim)
         self.softmax_scale = self.head_dim**-0.5
@@ -832,7 +846,7 @@ class Attention(nn.Module):
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        wo_a = _dequantized(self.wo_a.weight, self.wo_a.scale).view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         x = self.wo_b(o.flatten(2))
         return x
@@ -1257,7 +1271,7 @@ class DSparkAttention(Attention):
 
         o = o.view(bsz, block_size, self.n_local_groups, -1)
         act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        wo_a = _dequantized(self.wo_a.weight, self.wo_a.scale).view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         x = self.wo_b(o.flatten(2))
         return x

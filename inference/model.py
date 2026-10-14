@@ -178,9 +178,13 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+def linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, scale: torch.Tensor | None = None
+) -> torch.Tensor:
     """Pick a GEMM from the weight dtype. Quantized weights need a quantized activation, and both
-    fp4 and fp8 weights take an fp8 one -- for fp4 the kernel handles the mixed precision."""
+    fp4 and fp8 weights take an fp8 one -- for fp4 the kernel handles the mixed precision.
+    `scale` is a quantized weight's block scale. (vxpu: passed explicitly; the published code read
+    it from a `.scale` attribute on the weight tensor, which tracing with fake tensors drops.)"""
     assert bias is None
 
     if weight.dtype == torch.float4_e2m1fn_x2:
@@ -189,7 +193,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
             x,
             s,
             weight,
-            weight.scale,
+            scale,
             scale_dtype,
             act_block_size=fp8_block_size,
         )
@@ -199,7 +203,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
             x,
             s,
             weight,
-            weight.scale,
+            scale,
             scale_dtype,
             block_size=fp8_block_size,
         )
@@ -240,7 +244,7 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.weight, self.bias)
+        return linear(x, self.weight, self.bias, self.scale)
 
 
 class ColumnParallelLinear(Linear):
@@ -254,7 +258,7 @@ class ColumnParallelLinear(Linear):
         super().__init__(in_features, self.part_out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.weight, self.bias)
+        return linear(x, self.weight, self.bias, self.scale)
 
 
 class RowParallelLinear(Linear):
@@ -269,7 +273,7 @@ class RowParallelLinear(Linear):
         super().__init__(self.part_in_features, out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = linear(x, self.weight, None)
+        y = linear(x, self.weight, None, self.scale)
         if world_size > 1:
             y = y.float()
             dist.all_reduce(y)
@@ -406,22 +410,45 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     return y
 
 
-@lru_cache(1)
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
-    """Which sliding-window cache slots each query attends to; -1 marks a slot holding nothing.
 
+def _is_prefill(start_pos) -> bool:
+    """vxpu: a forward is a prefill from position 0 (start_pos the int 0) or a one-token decode
+    step (start_pos a 0-d tensor, or an int the caller passes; see _pos)."""
+    return isinstance(start_pos, int) and start_pos == 0
+
+
+def _pos(start_pos, device) -> torch.Tensor:
+    """The decode step's position as a 0-d int64 tensor on `device`."""
+    if torch.is_tensor(start_pos):
+        return start_pos.to(device=device, dtype=torch.long)
+    return torch.tensor(start_pos, device=device, dtype=torch.long)
+
+
+def _positions(start_pos, seqlen, device) -> torch.Tensor:
+    """Positions of the tokens in this forward: 0..seqlen-1 for a prefill, the step for decode."""
+    if _is_prefill(start_pos):
+        return torch.arange(seqlen, device=device)
+    return _pos(start_pos, device).view(1)
+
+
+def get_window_topk_idxs(window_size: int, bsz: int, seqlen, start_pos, device):
+    """Which sliding-window cache slots each query attends to; -1 marks a slot holding nothing.
     The cache is a ring of `window_size` slots. Prefill needs one row per query, each seeing its own
     causal window. A decode step has a single query that sees the whole ring, listed oldest first.
     Order within a row does not matter to `sparse_attn`, which handles every slot independently.
+    (vxpu: every row has `window_size` entries so shapes are static; the published code cut the
+    prefill rows to min(seqlen, window_size). A -1 slot is exactly what a missing slot was.)
     """
-    if start_pos == 0:
-        end = torch.arange(seqlen).unsqueeze(1)
-        idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+    win = window_size
+    if _is_prefill(start_pos):
+        end = torch.arange(seqlen, device=device).unsqueeze(1)
+        idxs = (end - win + 1).clamp(0) + torch.arange(win, device=device)
         idxs = torch.where(idxs > end, -1, idxs)  # before the sequence started
     else:
-        oldest = start_pos % window_size + 1
-        idxs = torch.cat([torch.arange(oldest, window_size), torch.arange(oldest)])
-        idxs = torch.where(idxs > start_pos, -1, idxs)  # ring still filling
+        start = _pos(start_pos, device)
+        oldest = start % win + 1
+        idxs = (torch.arange(win, device=device) + oldest) % win
+        idxs = torch.where(idxs > start, -1, idxs).unsqueeze(0)  # ring still filling
     # sparse_attn needs real [b, m, topk] int32 memory, hence the materializing expand
     return idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
 
@@ -455,34 +482,41 @@ class Compressor(nn.Module):
                 "score_state", torch.full(state_shape, -torch.inf, dtype=torch.float32), persistent=False
             )
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
+    def forward(self, x: torch.Tensor, start_pos) -> tuple[torch.Tensor, torch.Tensor | bool]:
+        """Returns (latent, ready): the pooled latent before RoPE, and whether it is a completed
+        group. Prefill returns the completed groups (ready is True); a decode step returns the
+        pooled state of the current group and ready says whether this step completed it. (vxpu:
+        the published code returned None instead of an unfinished group; callers now gate the
+        cache write on `ready`, which keeps shapes static. Same values, same writes.)"""
         bsz, seqlen, _ = x.size()
         ratio, dtype = self.compress_ratio, x.dtype
         if ratio == 1:  # one token per group: nothing to pool, so no gate and no fp32
-            return self.norm(self.wkv(x))
+            return self.norm(self.wkv(x)), torch.ones((), dtype=torch.bool, device=x.device)
 
         x = x.float()
         kv, score = self.wkv(x), self.wgate(x)
-        if start_pos == 0:
-            should_compress = seqlen >= ratio
+        if _is_prefill(start_pos):
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
-            if remainder:  # trailing partial group waits in the state
-                kv, self.kv_state[:bsz, :remainder] = kv.split([cutoff, remainder], dim=1)
-                score, self.score_state[:bsz, :remainder] = score.split([cutoff, remainder], dim=1)
-            kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio))
+            # the trailing partial group waits in the state: slot j holds token cutoff + j when
+            # j < remainder, else nothing (zero kv, -inf score, as a fresh state)
+            j = torch.arange(ratio, device=x.device)
+            tail = (cutoff + j).clamp(max=seqlen - 1)
+            valid = (j < remainder).view(1, ratio, 1)
+            self.kv_state[:bsz].copy_(torch.where(valid, kv.index_select(1, tail), 0.0))
+            self.score_state[:bsz].copy_(torch.where(valid, score.index_select(1, tail), -torch.inf))
+            kv = kv[:, :cutoff].unflatten(1, (cutoff // ratio, ratio))
+            score = score[:, :cutoff].unflatten(1, (cutoff // ratio, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        else:  # one token per step: fill a slot, and pool only when the group just completed
-            should_compress = (start_pos + 1) % ratio == 0
-            slot = start_pos % ratio
-            self.kv_state[:bsz, slot] = kv.squeeze(1)
-            self.score_state[:bsz, slot] = score.squeeze(1)
-            if should_compress:
-                kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
-        if not should_compress:
-            return None
-        return self.norm(kv.to(dtype))
+            return self.norm(kv.to(dtype)), True
+        # one token per step: fill a slot, and the group is complete when it was the last slot
+        start = _pos(start_pos, x.device)
+        slot = (start % ratio).view(1)
+        self.kv_state[:bsz].index_copy_(1, slot, kv)
+        self.score_state[:bsz].index_copy_(1, slot, score)
+        ready = (start + 1) % ratio == 0
+        kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
+        return self.norm(kv.to(dtype)), ready
 
 
 class Indexer(torch.nn.Module):
@@ -524,49 +558,56 @@ class Indexer(torch.nn.Module):
                 persistent=False,
             )
 
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor, start_pos: int, offset: int):
-        """`latent` is this layer's RoPE-free compressed latent, None when this layer does not
-        compress or when its current group is still incomplete. An index-key owner turns it into
-        index keys here, which has to happen before Attention overwrites that same storage with
-        the RoPE'd, quantized values."""
+    def forward(self, x: torch.Tensor, qr: torch.Tensor, latent, ready, start_pos, offset):
+        """`latent` is this layer's RoPE-free compressed latent and `ready` whether it is a
+        completed group (see Compressor.forward); None when this layer does not compress. An
+        index-key owner turns it into index keys here, which has to happen before Attention
+        overwrites that same storage with the RoPE'd, quantized values.
+        (vxpu: static shapes. The key cache is read whole and positions past what the query can
+        see are masked; top-k is always `index_topk` wide, with unreachable picks mapped to -1,
+        which is what the kernel treats as absent. `offset` may be a symbolic length.)"""
         assert self.freqs_cis is not None
         bsz, seqlen, _ = x.size()
-        ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
-
+        ratio, rd = self.compress_ratio, self.rope_head_dim
+        prefill = _is_prefill(start_pos)
+        device = x.device
         # Append index keys when a compression group completes.
         if self.owns_k and latent is not None:
-            # a latent stands for the first token of its group, so group j takes position j * ratio
-            freqs = (
-                self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if start_pos == 0
-                else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            )
+            if prefill:
+                n_groups = (seqlen - seqlen % ratio) // ratio
+                # a latent stands for the first token of its group, so group j takes position j * ratio
+                groups = torch.arange(n_groups, device=device)
+                freqs = self.freqs_cis.index_select(0, groups * ratio)
+            else:
+                start = _pos(start_pos, device)
+                groups = (start // ratio).view(1)
+                freqs = self.freqs_cis.index_select(0, (start + 1 - ratio).clamp_min(0).view(1))
             k = self.k_norm(self.wk(latent))
             apply_rotary_emb(k[..., -rd:], freqs)
             fp4_act_quant(k, fp4_block_size, True)
-            self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
+            if not prefill:  # an incomplete group leaves its slot as it was
+                k = torch.where(ready, k, self.k_cache[:bsz].index_select(1, groups))
+            self.k_cache[:bsz].index_copy_(1, groups, k.to(self.k_cache.dtype))
         if self.owns_k:
             shared_attn.index_k = self.k_cache
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
-        apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        apply_rotary_emb(q[..., -rd:], self.freqs_cis.index_select(0, _positions(start_pos, seqlen, device)))
         fp4_act_quant(q, fp4_block_size, True)
-
-        index_k = shared_attn.index_k[:bsz, : end_pos // ratio]
+        index_k = shared_attn.index_k[:bsz]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
             dist.all_reduce(index_score)
-
         # how many compressed positions each query can see: a block becomes visible once the query
         # has passed its last token. One query per decode step, so there it is just a number.
-        if start_pos == 0:
-            compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-            index_score.masked_fill_(torch.arange(seqlen // ratio, device=x.device) >= compress_lens, -torch.inf)
+        if prefill:
+            compress_lens = (torch.arange(1, seqlen + 1, device=device) // ratio).unsqueeze(-1)
         else:
-            compress_lens = end_pos // ratio
-
+            compress_lens = ((_pos(start_pos, device) + 1) // ratio).view(1, 1)
+        slots = torch.arange(index_k.size(1), device=device)
+        index_score = index_score.masked_fill(slots >= compress_lens, -torch.inf)
         if self.is_candidate_source:
             shared_attn.candidates = select_candidate_blocks(
                 index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
@@ -574,10 +615,8 @@ class Indexer(torch.nn.Module):
         elif self.uses_candidates:
             # level two: score with our own weights, but only inside the source's candidate blocks
             index_score = index_score.masked_fill(~shared_attn.candidates, -torch.inf)
-
         # top-k by score, re-sorted into position order; unreachable -> -1, rest shifted by offset
-        topk = min(self.index_topk, end_pos // ratio)
-        idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        idxs = index_score.topk(self.index_topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 
@@ -700,87 +739,84 @@ class Attention(nn.Module):
 
     def _window_kv(self, x, freqs_cis, start_pos):
         """This layer's sliding-window K and the window positions every query may attend to. The K
-        stays fp8, quantized over the whole post-RoPE vector, RoPE tail included."""
+        stays fp8, quantized over the whole post-RoPE vector, RoPE tail included.
+        (vxpu: the ring buffer is seeded with a gather per slot instead of two Python branches on
+        the length; each slot ends up holding the latest token that maps to it, as before.)"""
         bsz, seqlen, _ = x.size()
         win = self.window_size
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
         act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
-        if start_pos == 0:  # prefill: attend over this chunk, seeding the ring buffer for decode
-            if seqlen <= win:
-                self.window_kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = kv[:, -win:].split(
-                    [win - cutoff, cutoff], dim=1
-                )
+        if _is_prefill(start_pos):  # prefill: attend over this chunk, seeding the ring buffer for decode
+            slot = torch.arange(win, device=x.device)
+            newest = seqlen - 1 - ((seqlen - 1 - slot) % win)  # last position landing in this slot
+            seed = kv.index_select(1, newest.clamp_min(0))
+            self.window_kv_cache[:bsz].copy_(torch.where((newest >= 0).view(1, win, 1), seed, 0.0))
             window_kv = kv
         else:  # decode: one token into the ring buffer, attend over the whole window
-            self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            self.window_kv_cache[:bsz].index_copy_(1, (_pos(start_pos, x.device) % win).view(1), kv)
             window_kv = self.window_kv_cache[:bsz]
-        return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
 
-    def _compress_topk_idxs(self, x, qr, latent, start_pos, offset, compress_len):
+    def _compress_topk_idxs(self, x, qr, latent, ready, start_pos, offset):
         """Which compressed positions each query attends to. Index sources run their own indexer;
         the layers in between reuse the result their source published."""
         if not self.is_index_source:
             return shared_attn.topk_idxs
-
-        bsz, seqlen, _ = x.size()
-        if compress_len == 0:
-            idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
-        else:
-            assert self.indexer is not None
-            if self.indexer.freqs_cis is None:
-                self.indexer.freqs_cis = self.freqs_cis
-            idxs = self.indexer(x, qr, latent, start_pos, offset)
+        assert self.indexer is not None
+        if self.indexer.freqs_cis is None:
+            self.indexer.freqs_cis = self.freqs_cis
+        idxs = self.indexer(x, qr, latent, ready, start_pos, offset)
         shared_attn.topk_idxs = idxs
         return idxs
 
     def _compress_kv(self, x, qr, start_pos, offset):
         """The shared compressed KV and the compressed positions every query may attend to. This
-        layer compresses its own KV only when it is a source; otherwise it just reads the cache."""
+        layer compresses its own KV only when it is a source; otherwise it just reads the cache.
+        (vxpu: the cache is read whole; positions a query cannot see are never selected because
+        the indexer masks them. A decode step that did not complete a group writes its slot back
+        unchanged.)"""
         bsz, seqlen, _ = x.size()
         ratio = self.compress_ratio
-        compress_len = (start_pos + seqlen) // ratio
-        latent = None
+        device = x.device
+        latent, ready = None, True
         if self.is_kv_source:
-            latent = self.compressor(x, start_pos)
+            latent, ready = self.compressor(x, start_pos)
             shared_attn.compress_kv = self.compress_kv_cache
         # the indexer needs the latent before RoPE, so it runs before the cache is written
-        idxs = self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_len)
+        idxs = self._compress_topk_idxs(x, qr, latent, ready, start_pos, offset)
         if latent is not None:
             # a latent stands for the first token of its group, so group j takes position j * ratio
-            freqs = (
-                self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if start_pos == 0
-                else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            )
+            if _is_prefill(start_pos):
+                groups = torch.arange(latent.size(1), device=device)
+                freqs = self.freqs_cis.index_select(0, groups * ratio)
+            else:
+                start = _pos(start_pos, device)
+                groups = (start // ratio).view(1)
+                freqs = self.freqs_cis.index_select(0, (start + 1 - ratio).clamp_min(0).view(1))
             apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
             # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
             fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
-            self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent
+            if not _is_prefill(start_pos):
+                latent = torch.where(ready, latent, self.compress_kv_cache[:bsz].index_select(1, groups))
+            self.compress_kv_cache[:bsz].index_copy_(1, groups, latent.to(self.compress_kv_cache.dtype))
         # read after the write, so this does not depend on the slice aliasing the cache
-        return shared_attn.compress_kv[:bsz, :compress_len], idxs
+        return shared_attn.compress_kv[:bsz], idxs
 
-    def forward(self, x: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor, start_pos):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis.index_select(0, _positions(start_pos, seqlen, x.device))
         rd = self.rope_head_dim
-
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
-
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
-
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)

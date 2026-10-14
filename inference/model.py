@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from engram import EngramLayout, NgramHashState
 from image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
-from kernel import (
+from kernels import (  # tilelang on a GPU, plain aten elsewhere (see kernels.py)
     act_quant,
     fp4_act_quant,
     fp4_gemm,

@@ -156,17 +156,20 @@ class NgramHashState(nn.Module):
             "cache", torch.empty(args.max_batch_size, args.max_seq_len, dtype=torch.int64), persistent=False
         )
 
-    @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, start_pos, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """token_mask: [B, L], False for tokens that take no part in an n-gram (image spans).
-        Returns the hash ids, shaped [B, L, n_engram_layers, n_hash_cols]."""
+        Returns the hash ids, shaped [B, L, n_engram_layers, n_hash_cols].
+        (vxpu: start_pos is the int 0 for a prefill or a 0-d tensor for a decode step.)"""
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, self.DEAD)
-        self.cache[:batch, start_pos : start_pos + seqlen] = compressed
-
-        positions = torch.arange(start_pos, start_pos + seqlen, device=input_ids.device).expand(batch, seqlen)
+        if isinstance(start_pos, int) and start_pos == 0:
+            positions = torch.arange(seqlen, device=input_ids.device)
+        else:
+            positions = torch.as_tensor(start_pos, device=input_ids.device, dtype=torch.long).view(1) + torch.arange(seqlen, device=input_ids.device)
+        self.cache[:batch].index_copy_(1, positions, compressed)
+        positions = positions.expand(batch, seqlen)
         tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.layout.max_ngram_size):
             source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))

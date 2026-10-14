@@ -27,6 +27,13 @@ if _backend != "aten" and torch.cuda.is_available():
             hc_split_sinkhorn,
             sparse_attn,
         )
+
+        def fp4_quant_dequant(x, block_size=32, scale_dtype=torch.float8_e8m0fnu):
+            """Functional form of fp4_act_quant(inplace=True); see kernel_aten."""
+            y = x.clone()
+            fp4_act_quant(y, block_size, True, scale_dtype)
+            return y
+
         BACKEND = "tilelang"
     except ImportError:
         if _backend == "tilelang":
@@ -37,6 +44,7 @@ if _backend == "aten" or not torch.cuda.is_available():
         act_quant,
         fp4_act_quant,
         fp4_gemm,
+        fp4_quant_dequant,
         fp8_gemm,
         hc_split_sinkhorn,
         sparse_attn,

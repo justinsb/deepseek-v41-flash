@@ -113,6 +113,15 @@ def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0
     return y, s
 
 
+def fp4_quant_dequant(x, block_size=32, scale_dtype=torch.float8_e8m0fnu):
+    """fp4_act_quant(inplace=True) without the in-place write: returns the quantize-dequantized
+    tensor. (The in-place form on a tensor whose size is a derived symbolic expression makes
+    torch.export's shape reasoner ask whether that size is 1; this form does not.)"""
+    y = x.clone()
+    fp4_act_quant(y, block_size, True, scale_dtype)
+    return y
+
+
 def pack_fp4(values: torch.Tensor) -> torch.Tensor:
     """float32 values already on the e2m1 grid -> packed uint8 pairs (low nibble first)."""
     grid = _FP4_GRID.to(values.device)

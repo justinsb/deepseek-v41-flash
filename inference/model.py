@@ -13,6 +13,7 @@ from kernels import (  # tilelang on a GPU, plain aten elsewhere (see kernels.py
     act_quant,
     fp4_act_quant,
     fp4_gemm,
+    fp4_quant_dequant,
     fp8_gemm,
     hc_split_sinkhorn,
     sparse_attn,
@@ -411,6 +412,14 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 
 
+def _with_rotated_tail(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int) -> torch.Tensor:
+    """x with its last `rd` features rotated, as a new tensor (apply_rotary_emb writes in place,
+    which on a tensor sized by a derived symbolic expression makes export ask "is it 1?")."""
+    tail = x[..., -rd:].clone()
+    apply_rotary_emb(tail, freqs_cis)
+    return torch.cat([x[..., :-rd], tail], dim=-1)
+
+
 def _is_prefill(start_pos) -> bool:
     """vxpu: a forward is a prefill from position 0 (start_pos the int 0) or a one-token decode
     step (start_pos a 0-d tensor, or an int the caller passes; see _pos)."""
@@ -496,17 +505,20 @@ class Compressor(nn.Module):
         x = x.float()
         kv, score = self.wkv(x), self.wgate(x)
         if _is_prefill(start_pos):
-            remainder = seqlen % ratio
-            cutoff = seqlen - remainder
+            n_groups = seqlen // ratio  # complete groups; the cutoff is their product
+            cutoff = n_groups * ratio
             # the trailing partial group waits in the state: slot j holds token cutoff + j when
-            # j < remainder, else nothing (zero kv, -inf score, as a fresh state)
+            # j < seqlen - cutoff, else nothing (zero kv, -inf score, as a fresh state)
             j = torch.arange(ratio, device=x.device)
             tail = (cutoff + j).clamp(max=seqlen - 1)
-            valid = (j < remainder).view(1, ratio, 1)
+            valid = (j < seqlen - cutoff).view(1, ratio, 1)
             self.kv_state[:bsz].copy_(torch.where(valid, kv.index_select(1, tail), 0.0))
             self.score_state[:bsz].copy_(torch.where(valid, score.index_select(1, tail), -torch.inf))
-            kv = kv[:, :cutoff].unflatten(1, (cutoff // ratio, ratio))
-            score = score[:, :cutoff].unflatten(1, (cutoff // ratio, ratio))
+            # the complete groups, gathered by index: a symbolic narrow would make the shape
+            # reasoner prove cutoff <= seqlen, which it cannot for a product of a floor
+            complete = torch.arange(cutoff, device=x.device)
+            kv = kv.index_select(1, complete).unflatten(1, (n_groups, ratio))
+            score = score.index_select(1, complete).unflatten(1, (n_groups, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
             return self.norm(kv.to(dtype)), True
         # one token per step: fill a slot, and the group is complete when it was the last slot
@@ -574,7 +586,7 @@ class Indexer(torch.nn.Module):
         # Append index keys when a compression group completes.
         if self.owns_k and latent is not None:
             if prefill:
-                n_groups = (seqlen - seqlen % ratio) // ratio
+                n_groups = seqlen // ratio
                 # a latent stands for the first token of its group, so group j takes position j * ratio
                 groups = torch.arange(n_groups, device=device)
                 freqs = self.freqs_cis.index_select(0, groups * ratio)
@@ -583,8 +595,7 @@ class Indexer(torch.nn.Module):
                 groups = (start // ratio).view(1)
                 freqs = self.freqs_cis.index_select(0, (start + 1 - ratio).clamp_min(0).view(1))
             k = self.k_norm(self.wk(latent))
-            apply_rotary_emb(k[..., -rd:], freqs)
-            fp4_act_quant(k, fp4_block_size, True)
+            k = fp4_quant_dequant(_with_rotated_tail(k, freqs, rd), fp4_block_size)
             if not prefill:  # an incomplete group leaves its slot as it was
                 k = torch.where(ready, k, self.k_cache[:bsz].index_select(1, groups))
             self.k_cache[:bsz].index_copy_(1, groups, k.to(self.k_cache.dtype))
@@ -794,9 +805,9 @@ class Attention(nn.Module):
                 start = _pos(start_pos, device)
                 groups = (start // ratio).view(1)
                 freqs = self.freqs_cis.index_select(0, (start + 1 - ratio).clamp_min(0).view(1))
-            apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
             # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
-            fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
+            latent = fp4_quant_dequant(_with_rotated_tail(latent, freqs, self.rope_head_dim), 16,
+                                       scale_dtype=torch.float8_e4m3fn)
             if not _is_prefill(start_pos):
                 latent = torch.where(ready, latent, self.compress_kv_cache[:bsz].index_select(1, groups))
             self.compress_kv_cache[:bsz].index_copy_(1, groups, latent.to(self.compress_kv_cache.dtype))
@@ -891,13 +902,24 @@ class Expert(nn.Module):
 
 class MoE(nn.Module):
     """Top-k routed experts plus one shared expert every token goes through. Experts are split
-    across ranks, so `self.experts` is None for those another rank owns."""
+    across ranks, so this rank holds `n_local_experts` of them.
+
+    vxpu: the routed experts are held as banks (`w1`, `w2`, `w3` stacked over experts, with their
+    block scales) and evaluated with static shapes: for a prefill, pairs are sorted by expert and
+    a chunk of experts at a time is dequantized and run as grouped matmuls; for a decode step the
+    chosen experts are gathered and run as batched matmuls. Compute is proportional to tokens x
+    top-k in both, as the published per-expert loop was. The arithmetic per pair is the
+    published Expert's: fp8-quantized input, fp4 matmuls with float32 accumulation rounded to
+    bf16, clamps, SiLU, the routing weight applied before the down projection, whose input is
+    quantized again. The published per-expert checkpoint names load into the banks
+    (_load_from_state_dict)."""
 
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         n_routed_experts, n_activated_experts = args.get_moe_config(layer_id)
         self.layer_id = layer_id
         self.dim = args.dim
+        self.inter_dim = args.moe_inter_dim
         assert n_routed_experts % world_size == 0, (
             f"Number of experts must be divisible by world size (world_size={world_size})"
         )
@@ -907,39 +929,167 @@ class MoE(nn.Module):
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
-        expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
-        self.experts = nn.ModuleList(
-            [
-                Expert(
-                    args.dim,
-                    args.moe_inter_dim,
-                    dtype=expert_dtype,
-                    swiglu_limit=args.swiglu_limit,
-                )
-                if self.experts_start_idx <= i < self.experts_end_idx
-                else None
-                for i in range(self.n_routed_experts)
-            ]
-        )
+        self.swiglu_limit = args.swiglu_limit
+        self.expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else default_dtype
+        self.routing = "grouped"  # or "batched"; the exporter sets it per graph
+        self.experts_chunk = 32  # experts dequantized at once in the grouped routing
+        E, dim, inter = self.n_local_experts, args.dim, args.moe_inter_dim
+        self.w1, self.w1_scale = self._bank(E, inter, dim)
+        self.w3, self.w3_scale = self._bank(E, inter, dim)
+        self.w2, self.w2_scale = self._bank(E, dim, inter)
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
+
+    def _bank(self, n: int, out_features: int, in_features: int):
+        """A stack of n [out, in] weights in the expert dtype, with their scales (None for bf16)."""
+        if self.expert_dtype == torch.float4_e2m1fn_x2:
+            w = nn.Parameter(torch.empty(n, out_features, in_features // 2, dtype=torch.float4_e2m1fn_x2))
+            s = nn.Parameter(torch.empty(n, out_features, in_features // fp4_block_size, dtype=torch.float8_e8m0fnu))
+        elif self.expert_dtype == torch.float8_e4m3fn:
+            w = nn.Parameter(torch.empty(n, out_features, in_features, dtype=torch.float8_e4m3fn))
+            s = nn.Parameter(torch.empty(n, (out_features + fp8_block_size - 1) // fp8_block_size,
+                                         (in_features + fp8_block_size - 1) // fp8_block_size, dtype=torch.float8_e8m0fnu))
+        else:
+            w = nn.Parameter(torch.empty(n, out_features, in_features, dtype=self.expert_dtype))
+            s = None
+        return w, s
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # published layout: experts.<i>.w{1,2,3}.{weight,scale} -> bank rows
+        for proj in ("w1", "w2", "w3"):
+            bank, scale = getattr(self, proj), getattr(self, proj + "_scale")
+            for row, i in enumerate(range(self.experts_start_idx, self.experts_end_idx)):
+                for kind, dst in (("weight", bank), ("scale", scale)):
+                    key = f"{prefix}experts.{i}.{proj}.{kind}"
+                    if key in state_dict and dst is not None:
+                        src = state_dict.pop(key)
+                        with torch.no_grad():
+                            if dst.dtype == torch.float4_e2m1fn_x2:  # no copy kernel for fp4: move bytes
+                                dst.data[row].view(torch.uint8).copy_(src.view(torch.uint8))
+                            else:
+                                dst.data[row].copy_(src.to(dst.dtype))
+            for i in range(self.n_routed_experts):  # experts of other ranks
+                for kind in ("weight", "scale"):
+                    state_dict.pop(f"{prefix}experts.{i}.{proj}.{kind}", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @staticmethod
+    def _rows(bank: torch.Tensor, sel: torch.Tensor) -> torch.Tensor:
+        """bank[sel] for a bank of any dtype (the fp4 dtype has no index kernel on the CPU, so
+        its rows are gathered as bytes)."""
+        if bank.dtype == torch.float4_e2m1fn_x2:
+            return bank.view(torch.uint8)[sel].view(torch.float4_e2m1fn_x2)
+        return bank[sel]
+
+    @staticmethod
+    def _dequant(w: torch.Tensor, s: torch.Tensor | None) -> torch.Tensor:
+        """A bank slice [c, out, in(/2)] -> bf16 [c, out, in]. Scales are powers of two (e8m0), so
+        the products are exact in bf16 (fp4 and fp8 values fit bf16's mantissa)."""
+        if w.dtype == torch.float4_e2m1fn_x2:
+            vals = _unpack_fp4_bf16(w)  # [c, out, in]
+            return (vals.unflatten(-1, (-1, fp4_block_size)) * s.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
+        if w.dtype == torch.float8_e4m3fn:
+            c, out, inn = w.shape
+            blocks = w.to(torch.bfloat16).view(c, out // fp8_block_size, fp8_block_size, inn // fp8_block_size, fp8_block_size)
+            return (blocks * s.to(torch.bfloat16).view(c, out // fp8_block_size, 1, inn // fp8_block_size, 1)).view(c, out, inn)
+        return w
+
+    def _quantized_input(self, x: torch.Tensor) -> torch.Tensor:
+        """The published Expert quantizes its input per block (act_quant); the dequantized values
+        are exact in bf16, so the matmuls below see what the fp8 kernel saw."""
+        q, s = act_quant(x, fp8_block_size, scale_fmt, scale_dtype)
+        return (q.to(torch.bfloat16).unflatten(-1, (-1, fp8_block_size)) * s.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
+
+    def _ffn(self, gate: torch.Tensor, up: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """SwiGLU with the published clamps, times the routing weight, as the down projection's
+        (quantized) input. gate, up: bf16 matmul outputs; weights: [n]."""
+        gate, up = gate.float(), up.float()
+        if self.swiglu_limit > 0:
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+        h = weights.unsqueeze(-1) * (F.silu(gate) * up)
+        return self._quantized_input(h.to(torch.bfloat16))
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
-        y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
+        n, topk = indices.shape
+        x_in = self._quantized_input(x)
+        if self.routing == "batched":
+            y = self._forward_batched(x_in, weights, indices)
+        else:
+            y = self._forward_grouped(x_in, weights, indices)
         if world_size > 1:
             dist.all_reduce(y)
         y += self.shared_experts(x)
         return y.type_as(x).view(shape)
+
+    def _forward_batched(self, x_in, weights, indices):
+        """Decode routing: gather the chosen experts, one batched matmul per projection."""
+        n, topk = indices.shape
+        sel = (indices - self.experts_start_idx).flatten()  # [n * topk]
+        w1 = self._dequant(self._rows(self.w1, sel), None if self.w1_scale is None else self.w1_scale[sel])
+        w3 = self._dequant(self._rows(self.w3, sel), None if self.w3_scale is None else self.w3_scale[sel])
+        w2 = self._dequant(self._rows(self.w2, sel), None if self.w2_scale is None else self.w2_scale[sel])
+        xi = x_in.repeat_interleave(topk, dim=0).unsqueeze(-1)  # [n * topk, dim, 1]
+        gate = torch.bmm(w1, xi).squeeze(-1)
+        up = torch.bmm(w3, xi).squeeze(-1)
+        h = self._ffn(gate, up, weights.flatten())
+        d = torch.bmm(w2, h.unsqueeze(-1)).squeeze(-1).float()  # [n * topk, dim]
+        y = torch.zeros(n, self.dim, dtype=torch.float32, device=x_in.device)
+        return y.index_add_(0, torch.arange(n, device=x_in.device).repeat_interleave(topk), d)
+
+    def _forward_grouped(self, x_in, weights, indices):
+        """Prefill routing: pairs sorted by expert, grouped matmuls over a chunk of experts at a
+        time so that only that chunk is dequantized at once."""
+        n, topk = indices.shape
+        E = self.n_local_experts
+        flat = (indices - self.experts_start_idx).flatten()
+        order = flat.argsort(stable=True)
+        token = order // topk
+        wgt = weights.flatten()[order]
+        counts = torch.zeros(E, dtype=torch.int64, device=flat.device).scatter_add_(0, flat, torch.ones_like(flat))
+        offsets = counts.cumsum(0)
+        x_sorted = x_in[token]  # [n * topk, dim]
+        out = torch.zeros(n * topk, self.dim, dtype=torch.float32, device=x_in.device)
+        C = min(self.experts_chunk, E)
+        for c0 in range(0, E, C):
+            c1 = min(c0 + C, E)
+            if E <= C:  # one chunk: every pair, static bounds
+                start, length = 0, n * topk
+            else:
+                start = (offsets[c0 - 1] if c0 else offsets.new_zeros(())).item()
+                length = offsets[c1 - 1].item() - start
+                torch._check_is_size(start)
+                torch._check_is_size(length)
+                torch._check(start + length <= n * topk)
+            xa = x_sorted.narrow(0, start, length)
+            offs = (offsets[c0:c1] - start).to(torch.int32)
+            w1 = self._dequant(self.w1[c0:c1], None if self.w1_scale is None else self.w1_scale[c0:c1])
+            w3 = self._dequant(self.w3[c0:c1], None if self.w3_scale is None else self.w3_scale[c0:c1])
+            w2 = self._dequant(self.w2[c0:c1], None if self.w2_scale is None else self.w2_scale[c0:c1])
+            gate = torch._grouped_mm(xa, w1.transpose(1, 2), offs=offs)
+            up = torch._grouped_mm(xa, w3.transpose(1, 2), offs=offs)
+            h = self._ffn(gate, up, wgt.narrow(0, start, length))
+            d = torch._grouped_mm(h, w2.transpose(1, 2), offs=offs)
+            out.narrow(0, start, length).copy_(d.float())
+        y = torch.zeros(n, self.dim, dtype=torch.float32, device=x_in.device)
+        return y.index_add_(0, token, out)
+
+
+_FP4_TABLE_BF16 = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.bfloat16,
+)
+
+
+def _unpack_fp4_bf16(packed: torch.Tensor) -> torch.Tensor:
+    """[..., K//2] packed e2m1 pairs -> [..., K] bf16 (low nibble first), by table lookup:
+    torch has no CPU kernels for the fp4 dtype."""
+    b = packed.view(torch.uint8)
+    table = _FP4_TABLE_BF16.to(b.device)
+    return torch.stack([table[(b & 0x0F).long()], table[((b >> 4) & 0x0F).long()]], dim=-1).flatten(-2)
 
 
 class Block(nn.Module):
@@ -1277,14 +1427,17 @@ class Transformer(nn.Module):
                 embeds = self.encode_image(img.patches.to(h.device), img.n_vit_h, img.n_vit_w)
                 span[types == IMAGE] = embeds.to(h.dtype)
 
-    @torch.inference_mode()
     def forward(
-        self, input_ids: torch.Tensor, start_pos: int = 0, images=None, token_types: torch.Tensor | None = None
+        self, input_ids: torch.Tensor, start_pos=0, images=None, token_types: torch.Tensor | None = None
     ):
         """input_ids: [b, s], every entry a real token id -- generate.py only ever passes positions it
         has already filled, so the padding it uses internally never reaches here. token_types /
         images carry the VL inputs built by image_processor.prepare_vl_inputs; image spans must lie
         inside the first (start_pos 0) chunk."""
+        # vxpu: a prefill is start_pos == 0; a decode step carries its position as a tensor, so
+        # the same code traces for every step (an int from generate.py is wrapped here)
+        if not _is_prefill(start_pos) and not torch.is_tensor(start_pos):
+            start_pos = torch.tensor(start_pos, device=input_ids.device, dtype=torch.long)
         image_mask = None if token_types is None else token_types >= 0  # TEXT is -1
         # image tokens take no part in an n-gram and get no engram contribution; text-only needs no mask
         engram_mask = None if image_mask is None else ~image_mask

@@ -79,7 +79,7 @@ def compute_hash_multipliers(
             size=(max_ngram_size,),
             dtype=np.int64,
         )
-        rows.append(torch.tensor(values * 2 + 1))
+        rows.append(torch.tensor(values * 2 + 1, device="cpu"))  # vxpu: a constant, built on the CPU
     return torch.stack(rows)
 
 

@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from engram import EngramLayout, NgramHashState
 from image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
-from kernels import (  # tilelang on a GPU, plain aten elsewhere (see kernels.py)
+from ds_kernels import (  # tilelang on a GPU, plain aten elsewhere (see ds_kernels.py)
     act_quant,
     fp4_act_quant,
     fp4_gemm,
@@ -957,7 +957,10 @@ class MoE(nn.Module):
     def _bank(self, n: int, out_features: int, in_features: int):
         """A stack of n [out, in] weights in the expert dtype, with their scales (None for bf16)."""
         if self.expert_dtype == torch.float4_e2m1fn_x2:
-            w = nn.Parameter(torch.empty(n, out_features, in_features // 2, dtype=torch.float4_e2m1fn_x2))
+            # fp4 pairs are kept as bytes, as the checkpoint stores them: torch has no CPU kernels
+            # for the fp4 dtype and torch.export cannot serialize it; the values are decoded by
+            # table lookup where they are used (_dequant)
+            w = nn.Parameter(torch.empty(n, out_features, in_features // 2, dtype=torch.uint8), requires_grad=False)
             s = nn.Parameter(torch.empty(n, out_features, in_features // fp4_block_size, dtype=torch.float8_e8m0fnu))
         elif self.expert_dtype == torch.float8_e4m3fn:
             w = nn.Parameter(torch.empty(n, out_features, in_features, dtype=torch.float8_e4m3fn))
@@ -978,8 +981,8 @@ class MoE(nn.Module):
                     if key in state_dict and dst is not None:
                         src = state_dict.pop(key)
                         with torch.no_grad():
-                            if dst.dtype == torch.float4_e2m1fn_x2:  # no copy kernel for fp4: move bytes
-                                dst.data[row].view(torch.uint8).copy_(src.view(torch.uint8))
+                            if dst.dtype == torch.uint8:  # packed fp4, stored as int8 or fp4: move bytes
+                                dst.data[row].copy_(src.view(torch.uint8))
                             else:
                                 dst.data[row].copy_(src.to(dst.dtype))
             for i in range(self.n_routed_experts):  # experts of other ranks
@@ -989,17 +992,13 @@ class MoE(nn.Module):
 
     @staticmethod
     def _rows(bank: torch.Tensor, sel: torch.Tensor) -> torch.Tensor:
-        """bank[sel] for a bank of any dtype (the fp4 dtype has no index kernel on the CPU, so
-        its rows are gathered as bytes)."""
-        if bank.dtype == torch.float4_e2m1fn_x2:
-            return bank.view(torch.uint8)[sel].view(torch.float4_e2m1fn_x2)
         return bank[sel]
 
     @staticmethod
     def _dequant(w: torch.Tensor, s: torch.Tensor | None) -> torch.Tensor:
         """A bank slice [c, out, in(/2)] -> bf16 [c, out, in]. Scales are powers of two (e8m0), so
         the products are exact in bf16 (fp4 and fp8 values fit bf16's mantissa)."""
-        if w.dtype == torch.float4_e2m1fn_x2:
+        if w.dtype == torch.uint8:  # packed fp4 pairs
             vals = _unpack_fp4_bf16(w)  # [c, out, in]
             return (vals.unflatten(-1, (-1, fp4_block_size)) * s.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
         if w.dtype == torch.float8_e4m3fn:
@@ -1101,7 +1100,7 @@ _FP4_TABLE_BF16 = torch.tensor(
 def _unpack_fp4_bf16(packed: torch.Tensor) -> torch.Tensor:
     """[..., K//2] packed e2m1 pairs -> [..., K] bf16 (low nibble first), by table lookup:
     torch has no CPU kernels for the fp4 dtype."""
-    b = packed.view(torch.uint8)
+    b = packed if packed.dtype == torch.uint8 else packed.view(torch.uint8)
     table = _FP4_TABLE_BF16.to(b.device)
     return torch.stack([table[(b & 0x0F).long()], table[((b >> 4) & 0x0F).long()]], dim=-1).flatten(-2)
 

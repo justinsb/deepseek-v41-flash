@@ -314,7 +314,19 @@ class ParallelEngramEmbedding(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn))
         self.scale = nn.Parameter(torch.empty(self.part_num_embeddings, dim // self.block_size, dtype=scale_dtype))
 
+    # vxpu: a table placed elsewhere (host memory, a memory-mapped file). When set, forward
+    # calls rows_fn(indices, table_id) instead of lookup(); the exporter sets it so the traced
+    # graph carries a call rather than the table, and the runtime answers the call.
+    rows_fn = None
+    table_id = -1
+
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.rows_fn is not None:
+            return self.rows_fn(indices, self.table_id)
+        return self.lookup(indices)
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """The rows for `indices`, dequantized to bf16; zero outside this rank's shard."""
         mask = (indices < self.vocab_start_idx) | (indices >= self.vocab_end_idx)
         local_indices = indices - self.vocab_start_idx
         local_indices = local_indices.masked_fill(mask, 0)
@@ -346,6 +358,7 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
 
         self.embed = ParallelEngramEmbedding(layout.num_embeddings[self.layer_hash_index], layout.head_dim)
+        self.embed.table_id = layer_id  # names the table to a placed lookup (see rows_fn)
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = Linear(n_hash_cols * layout.head_dim, args.dim * (args.hc_mult + 1))
         self.eps = args.norm_eps
@@ -946,6 +959,10 @@ class MoE(nn.Module):
         self.swiglu_limit = args.swiglu_limit
         self.expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else default_dtype
         self.routing = "grouped"  # or "batched"; the exporter sets it per graph
+        # vxpu: the expert evaluation placed elsewhere. When set, forward calls
+        # experts_fn(x_in, weights, indices, layer_id) -> y [n, dim] float32, exactly what the
+        # routings below return, instead of reading the banks held by this module.
+        self.experts_fn = None
         self.experts_chunk = 32  # experts dequantized at once in the grouped routing
         E, dim, inter = self.n_local_experts, args.dim, args.moe_inter_dim
         self.w1, self.w1_scale = self._bank(E, inter, dim)
@@ -1029,7 +1046,9 @@ class MoE(nn.Module):
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
         n, topk = indices.shape
         x_in = self._quantized_input(x)
-        if self.routing == "batched":
+        if self.experts_fn is not None:
+            y = self.experts_fn(x_in, weights, indices, self.layer_id)
+        elif self.routing == "batched":
             y = self._forward_batched(x_in, weights, indices)
         else:
             y = self._forward_grouped(x_in, weights, indices)

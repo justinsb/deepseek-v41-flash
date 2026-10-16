@@ -179,6 +179,13 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
+# vxpu: an fp8 linear placed elsewhere. When set, linear() calls linear_fn(x, weight, scale) for
+# fp8 weights instead of act_quant + fp8_gemm below; the exporter sets it so the traced graph
+# carries one call per linear, and the runtime answers it (with a fused kernel on the CPU, with
+# these same functions elsewhere).
+linear_fn = None
+
+
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, scale: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -188,6 +195,8 @@ def linear(
     it from a `.scale` attribute on the weight tensor, which tracing with fake tensors drops.)"""
     assert bias is None
 
+    if linear_fn is not None and weight.dtype == torch.float8_e4m3fn:
+        return linear_fn(x, weight, scale)
     if weight.dtype == torch.float4_e2m1fn_x2:
         x, s = act_quant(x, fp8_block_size, scale_fmt, scale_dtype)
         return fp4_gemm(

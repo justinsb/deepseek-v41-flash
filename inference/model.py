@@ -185,6 +185,11 @@ class ParallelEmbedding(nn.Module):
 # these same functions elsewhere).
 linear_fn = None
 
+# vxpu: the attention's grouped output projection (wo_a, block-diagonal over groups) placed
+# elsewhere. When set, grouped_linear_fn(o, weight, scale) maps o [b, s, g, d], already on the fp8
+# grid, to [b, s, g, r] in place of dequantizing the whole weight and an einsum on every call.
+grouped_linear_fn = None
+
 
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, scale: torch.Tensor | None = None
@@ -444,6 +449,15 @@ def _dequantized(weight: torch.Tensor, scale: torch.Tensor | None) -> torch.Tens
     bs = fp8_block_size
     blocks = weight.to(torch.bfloat16).view(out // bs, bs, inn // bs, bs)
     return (blocks * scale.to(torch.bfloat16).view(out // bs, 1, inn // bs, 1)).view(out, inn)
+
+
+def _grouped_output(o: torch.Tensor, wo_a: nn.Module, n_groups: int, rank: int) -> torch.Tensor:
+    """o [b, s, g, d] through wo_a, which is block-diagonal over groups (each projects only its
+    own heads), hence einsum not Linear -> [b, s, g, r]."""
+    if grouped_linear_fn is not None and wo_a.weight.dtype == torch.float8_e4m3fn:
+        return grouped_linear_fn(o, wo_a.weight, wo_a.scale)
+    w = _dequantized(wo_a.weight, wo_a.scale).view(n_groups, rank, -1)
+    return torch.einsum("bsgd,grd->bsgr", o, w)
 
 
 def _with_rotated_tail(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int) -> torch.Tensor:
@@ -868,8 +882,7 @@ class Attention(nn.Module):
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)
-        wo_a = _dequantized(self.wo_a.weight, self.wo_a.scale).view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        o = _grouped_output(o, self.wo_a, self.n_local_groups, self.o_lora_rank)
         x = self.wo_b(o.flatten(2))
         return x
 
@@ -1298,8 +1311,7 @@ class DSparkAttention(Attention):
 
         o = o.view(bsz, block_size, self.n_local_groups, -1)
         act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)
-        wo_a = _dequantized(self.wo_a.weight, self.wo_a.scale).view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        o = _grouped_output(o, self.wo_a, self.n_local_groups, self.o_lora_rank)
         x = self.wo_b(o.flatten(2))
         return x
 

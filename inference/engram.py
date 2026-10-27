@@ -166,12 +166,15 @@ class NgramHashState(nn.Module):
         compressed = self.token_map[input_ids]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, self.DEAD)
+        steps = torch.arange(seqlen, device=input_ids.device)
         if isinstance(start_pos, int) and start_pos == 0:
-            positions = torch.arange(seqlen, device=input_ids.device)
-        else:
-            positions = torch.as_tensor(start_pos, device=input_ids.device, dtype=torch.long).view(1) + torch.arange(seqlen, device=input_ids.device)
-        self.cache[:batch].index_copy_(1, positions, compressed)
-        positions = positions.expand(batch, seqlen)
+            self.cache[:batch].index_copy_(1, steps, compressed)
+            positions = steps.expand(batch, seqlen)
+        else:  # vxpu: each row at its own position (a single position applies to every row)
+            start = torch.as_tensor(start_pos, device=input_ids.device, dtype=torch.long).reshape(-1)
+            positions = start.expand(batch).view(batch, 1) + steps
+            rows = torch.arange(batch, device=input_ids.device).view(batch, 1).expand(batch, seqlen)
+            self.cache.index_put_((rows, positions), compressed)
         tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.layout.max_ngram_size):
             source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))

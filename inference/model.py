@@ -132,6 +132,7 @@ class ModelArgs:
     image_token_id: int = 129264
     # dspark draft head. Only the forward pass is implemented here -- nothing calls forward_spec,
     # so these are read but the speculative-decoding loop itself is out of scope for this repo.
+    # (vxpu: the engine runs the loop, over spec_observe and spec_draft.)
     dspark_block_size: int = 0
     dspark_noise_token_id: int = 0
     dspark_target_layer_ids: tuple[int, ...] = ()
@@ -475,8 +476,8 @@ def _with_rotated_tail(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int) -> tor
 
 
 def _is_prefill(start_pos) -> bool:
-    """vxpu: a forward is a prefill from position 0 (start_pos the int 0) or a one-token decode
-    step (start_pos a tensor of positions, or an int the caller passes; see _pos)."""
+    """vxpu: a forward is a prefill from position 0 (start_pos the int 0) or a decode step
+    (start_pos a tensor of positions, or an int the caller passes; see _pos)."""
     return isinstance(start_pos, int) and start_pos == 0
 
 
@@ -1306,42 +1307,47 @@ class ParallelHead(nn.Module):
         return logits
 
 
-@lru_cache(1)
-def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos: int):
-    assert start_pos > 0
-    matrix = torch.cat(
-        [
-            torch.arange(min(window_size, start_pos + 1)),
-            window_size + torch.arange(block_size),
-        ]
-    )
-    return matrix.int().view(1, 1, -1).expand(bsz, block_size, -1).contiguous()
+def get_dspark_topk_idxs(window_size: int, slots: int, bsz: int, block_size: int, block_pos, device):
+    """What a draft block's queries attend to, over the ring followed by the block's own keys: the
+    ring slots holding the window of target positions before the block, then the whole block.
+    vxpu: each row's block starts at its own position (block_pos [bsz]); the ring has `slots` slots
+    and slot j holds the latest position that maps to it, ring slots listed in slot order."""
+    newest = _pos(block_pos, device, bsz).view(bsz, 1) - 1
+    j = torch.arange(slots, device=device)
+    held = newest - (newest - j) % slots
+    ring = torch.where((held > newest - window_size) & (held >= 0), j, -1)
+    block = (slots + torch.arange(block_size, device=device)).expand(bsz, -1)
+    return torch.cat([ring, block], dim=1).int().view(bsz, 1, -1).expand(bsz, block_size, -1).contiguous()
 
 
 class DSparkAttention(Attention):
-    def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor):
+    def observe(self, main_x: torch.Tensor, start_pos):
+        """vxpu: write the target's hidden states (projected: main_x [bsz, seqlen, dim]) at this
+        forward's positions into the window ring: a prefill seeds it, a decode step of one or more
+        tokens per row writes its positions, each row from its own start."""
         assert self.compress_ratio == 0
         bsz, seqlen, _ = main_x.size()
-        win = self.window_size
         rd = self.rope_head_dim
-
-        main_freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        slots = self.window_slots
+        positions = _positions(start_pos, seqlen, bsz, main_x.device)
         main_kv = self.kv_norm(self.wkv(main_x))
-        apply_rotary_emb(main_kv[..., -rd:], main_freqs_cis)
+        apply_rotary_emb(main_kv[..., -rd:], self.freqs_cis[positions])
         act_quant(main_kv, fp8_block_size, scale_fmt, scale_dtype, True)
+        if _is_prefill(start_pos):
+            slot = torch.arange(slots, device=main_x.device)
+            newest = seqlen - 1 - ((seqlen - 1 - slot) % slots)  # last position landing in this slot
+            seed = main_kv.index_select(1, newest.clamp_min(0))
+            self.window_kv_cache[:bsz].copy_(torch.where((newest >= 0).view(1, slots, 1), seed, 0.0))
+        else:
+            rows = torch.arange(bsz, device=main_x.device).view(bsz, 1).expand(bsz, seqlen)
+            self.window_kv_cache.index_put_((rows, positions % slots), main_kv)
 
-        if start_pos == 0:
-            if seqlen <= win:
-                self.window_kv_cache[:bsz, :seqlen] = main_kv
-            else:
-                cutoff = seqlen % win
-                self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = main_kv[:, -win:].split(
-                    [win - cutoff, cutoff], dim=1
-                )
-            return x
-
+    def forward(self, x: torch.Tensor, start_pos):
+        """The draft block, x [bsz, block, dim], each row's at its own positions from start_pos
+        (vxpu: [bsz]); it reads the ring that observe wrote, and does not write it."""
         bsz, block_size, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos + seqlen : start_pos + seqlen + block_size]
+        rd = self.rope_head_dim
+        freqs_cis = self.freqs_cis[_positions(start_pos, block_size, bsz, x.device)]
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -1350,8 +1356,7 @@ class DSparkAttention(Attention):
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
 
-        topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos)
-        self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1)
+        topk_idxs = get_dspark_topk_idxs(self.window_size, self.window_slots, bsz, block_size, start_pos, x.device)
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
@@ -1408,20 +1413,19 @@ class DSparkBlock(Block):
         self.embed: ParallelEmbedding | None = None
         self.head: ParallelHead | None = None
 
-    def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor, main_x: torch.Tensor):
-        if start_pos == 0:
-            self.attn(x, start_pos, main_x)  # prefill only seeds the window KV cache
-            return x, pre_mix
-        return super().forward(x, start_pos, pre_mix, None, main_x)  # drafts are text: no VL bias
+    def forward(self, x: torch.Tensor, start_pos, pre_mix: torch.Tensor):
+        return super().forward(x, start_pos, pre_mix, None)  # drafts are text: no VL bias
 
-    def forward_embed(self, main_hidden: torch.Tensor, input_ids: torch.Tensor):
+    def forward_main(self, main_hidden: torch.Tensor):
+        """The target's hidden states as the stages' attention sees them (stage 0 only)."""
+        return self.main_norm(self.main_proj(main_hidden))
+
+    def forward_embed(self, input_ids: torch.Tensor):
         assert self.embed is not None
-        main_x = self.main_norm(self.main_proj(main_hidden))
         draft_input_ids = input_ids.new_full([input_ids.size(0), self.block_size], self.noise_token_id)
         draft_input_ids[:, 0] = input_ids
         x = self.embed(draft_input_ids)
-        x = x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        return x, main_x
+        return x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
     def forward_head(
         self,
@@ -1566,12 +1570,28 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward_spec(self, input_ids: torch.Tensor, main_hidden: torch.Tensor, start_pos: int = 0):
-        h, main_x = self.mtp[0].forward_embed(main_hidden, input_ids)
+        self.spec_observe(main_hidden, start_pos)
+        if _is_prefill(start_pos):
+            return None
+        return self.spec_draft(input_ids, start_pos + 1)
+
+    # vxpu: forward_spec in two parts, so each runs in its own graph. A verifying decode step
+    # observes the target's hidden states of all its tokens; a draft step reads them.
+    def spec_observe(self, main_hidden: torch.Tensor, start_pos):
+        """Every stage's window ring takes the target's hidden states (main_hidden [bsz, seqlen,
+        layers * dim], from forward) at that forward's positions."""
+        main_x = self.mtp[0].forward_main(main_hidden)
+        for layer in self.mtp:
+            layer.attn.observe(main_x, start_pos)
+
+    def spec_draft(self, input_ids: torch.Tensor, start_pos):
+        """Draft the tokens after input_ids [bsz], each row's next token, at its position start_pos
+        (a decode position: an int, or [bsz]). Returns (output_ids [bsz, block + 1], input_ids
+        then the drafts; logits; confidence)."""
+        h = self.mtp[0].forward_embed(input_ids)
         pre_mix = make_identity_pre_mix(h, self.hc_mult)
         for layer in self.mtp:
-            h, pre_mix = layer(h, start_pos, pre_mix, main_x)
-        if start_pos == 0:
-            return None
+            h, pre_mix = layer(h, start_pos, pre_mix)
         return self.mtp[-1].forward_head(h, pre_mix, input_ids)
 
 

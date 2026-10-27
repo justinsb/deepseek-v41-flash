@@ -600,8 +600,8 @@ class Compressor(nn.Module):
         latents, readies = [], []
         for t in range(seqlen):
             pos = start + t
-            self.kv_state.index_put_((rows, pos % self.slots), kv[:, t])
-            self.score_state.index_put_((rows, pos % self.slots), score[:, t])
+            self.kv_state[:bsz].index_put_((rows, pos % self.slots), kv[:, t])
+            self.score_state[:bsz].index_put_((rows, pos % self.slots), score[:, t])
             readies.append((pos + 1) % ratio == 0)
             # pool the current group's slots, in position order (as the slots were without slack)
             group = ((pos // ratio) * ratio).view(bsz, 1) + torch.arange(ratio, device=x.device)
@@ -684,7 +684,7 @@ class Indexer(torch.nn.Module):
                     # an incomplete group leaves its slot as it was
                     done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
                     k = torch.where(done, k, self.k_cache[rows, groups].unsqueeze(1))
-                    self.k_cache.index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
+                    self.k_cache[:bsz].index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
         if self.owns_k:
             shared_attn.index_k = self.k_cache
 
@@ -857,7 +857,7 @@ class Attention(nn.Module):
         else:  # decode: each row's tokens into its ring buffer, then attend over the ring
             positions = _positions(start_pos, seqlen, bsz, x.device)
             rows = torch.arange(bsz, device=x.device).view(bsz, 1).expand(bsz, seqlen)
-            self.window_kv_cache.index_put_((rows, positions % slots), kv)
+            self.window_kv_cache[:bsz].index_put_((rows, positions % slots), kv)
             window_kv = self.window_kv_cache[:bsz]
         return window_kv, get_window_topk_idxs(win, slots, bsz, seqlen, start_pos, x.device)
 
@@ -908,7 +908,7 @@ class Attention(nn.Module):
                     # an incomplete group leaves its slot as it was
                     done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
                     out = torch.where(done, out, self.compress_kv_cache[rows, groups].unsqueeze(1))
-                    self.compress_kv_cache.index_put_((rows, groups), out[:, 0].to(self.compress_kv_cache.dtype))
+                    self.compress_kv_cache[:bsz].index_put_((rows, groups), out[:, 0].to(self.compress_kv_cache.dtype))
         # read after the write, so this does not depend on the slice aliasing the cache
         return shared_attn.compress_kv[:bsz], idxs
 
@@ -1340,7 +1340,7 @@ class DSparkAttention(Attention):
             self.window_kv_cache[:bsz].copy_(torch.where((newest >= 0).view(1, slots, 1), seed, 0.0))
         else:
             rows = torch.arange(bsz, device=main_x.device).view(bsz, 1).expand(bsz, seqlen)
-            self.window_kv_cache.index_put_((rows, positions % slots), main_kv)
+            self.window_kv_cache[:bsz].index_put_((rows, positions % slots), main_kv)
 
     def forward(self, x: torch.Tensor, start_pos):
         """The draft block, x [bsz, block, dim], each row's at its own positions from start_pos

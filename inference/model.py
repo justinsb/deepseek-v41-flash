@@ -226,6 +226,10 @@ window_kv_fn = None
 # o_lora_rank, wo_b, wo_b_scale, rope_head_dim) -> [b, s, dim]. When set, Attention.forward uses
 # it for fp8 weights.
 attn_out_fn = None
+# vxpu: the compressed KV and index key finishing (the rope tail's rotary and fp4 quantization)
+# placed elsewhere. When set, _compress_kv and Indexer.forward use it in the decode branch:
+# compress_post_fn(x, freqs_cis, rope_dim, quant_kind) -> [b, s, D] bf16.
+compress_post_fn = None
 
 
 def linear(
@@ -710,14 +714,24 @@ class Indexer(torch.nn.Module):
                 start = _pos(start_pos, device, bsz)
                 rows = torch.arange(bsz, device=device)
                 k_all = self.k_norm(self.wk(latent))
-                for t in range(seqlen):
-                    groups = (start + t) // ratio
-                    freqs = self.freqs_cis[(start + t + 1 - ratio).clamp_min(0)].unsqueeze(1)
-                    k = fp4_quant_dequant(_with_rotated_tail(k_all[:, t : t + 1], freqs, rd), fp4_block_size)
-                    # an incomplete group leaves its slot as it was
-                    done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
-                    k = torch.where(done, k, self.k_cache[rows, groups].unsqueeze(1))
-                    self.k_cache[:bsz].index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
+                if compress_post_fn is not None:
+                    pos = (start.view(bsz, 1) + torch.arange(seqlen, device=device) + 1 - ratio).clamp_min(0)
+                    k_all_post = compress_post_fn(k_all, self.freqs_cis[pos], rd, "e8m0")
+                    for t in range(seqlen):
+                        groups = (start + t) // ratio
+                        k = k_all_post[:, t : t + 1]
+                        done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
+                        k = torch.where(done, k, self.k_cache[rows, groups].unsqueeze(1))
+                        self.k_cache[:bsz].index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
+                else:
+                    for t in range(seqlen):
+                        groups = (start + t) // ratio
+                        freqs = self.freqs_cis[(start + t + 1 - ratio).clamp_min(0)].unsqueeze(1)
+                        k = fp4_quant_dequant(_with_rotated_tail(k_all[:, t : t + 1], freqs, rd), fp4_block_size)
+                        # an incomplete group leaves its slot as it was
+                        done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
+                        k = torch.where(done, k, self.k_cache[rows, groups].unsqueeze(1))
+                        self.k_cache[:bsz].index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
         if self.owns_k:
             shared_attn.index_k = self.k_cache
 
@@ -937,15 +951,26 @@ class Attention(nn.Module):
             else:  # each row's own groups, token by token: a later token may complete the group
                 start = _pos(start_pos, device, bsz)
                 rows = torch.arange(bsz, device=device)
-                for t in range(seqlen):
-                    groups = (start + t) // ratio
-                    freqs = self.freqs_cis[(start + t + 1 - ratio).clamp_min(0)].unsqueeze(1)
-                    out = fp4_quant_dequant(_with_rotated_tail(latent[:, t : t + 1], freqs, self.rope_head_dim), 16,
-                                            scale_dtype=torch.float8_e4m3fn)
-                    # an incomplete group leaves its slot as it was
-                    done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
-                    out = torch.where(done, out, self.compress_kv_cache[rows, groups].unsqueeze(1))
-                    self.compress_kv_cache[:bsz].index_put_((rows, groups), out[:, 0].to(self.compress_kv_cache.dtype))
+                if compress_post_fn is not None:
+                    pos = (start.view(bsz, 1) + torch.arange(seqlen, device=device) + 1 - ratio).clamp_min(0)
+                    out_all = compress_post_fn(latent, self.freqs_cis[pos], self.rope_head_dim, "e4m3")
+                    for t in range(seqlen):
+                        groups = (start + t) // ratio
+                        out = out_all[:, t : t + 1]
+                        # an incomplete group leaves its slot as it was
+                        done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
+                        out = torch.where(done, out, self.compress_kv_cache[rows, groups].unsqueeze(1))
+                        self.compress_kv_cache[:bsz].index_put_((rows, groups), out[:, 0].to(self.compress_kv_cache.dtype))
+                else:
+                    for t in range(seqlen):
+                        groups = (start + t) // ratio
+                        freqs = self.freqs_cis[(start + t + 1 - ratio).clamp_min(0)].unsqueeze(1)
+                        out = fp4_quant_dequant(_with_rotated_tail(latent[:, t : t + 1], freqs, self.rope_head_dim), 16,
+                                                scale_dtype=torch.float8_e4m3fn)
+                        # an incomplete group leaves its slot as it was
+                        done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
+                        out = torch.where(done, out, self.compress_kv_cache[rows, groups].unsqueeze(1))
+                        self.compress_kv_cache[:bsz].index_put_((rows, groups), out[:, 0].to(self.compress_kv_cache.dtype))
         # read after the write, so this does not depend on the slice aliasing the cache
         return shared_attn.compress_kv[:bsz], idxs
 

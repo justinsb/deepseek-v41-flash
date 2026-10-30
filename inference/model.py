@@ -194,6 +194,15 @@ linear_fn = None
 # grid, to [b, s, g, r] in place of dequantizing the whole weight and an einsum on every call.
 grouped_linear_fn = None
 
+# vxpu: a block's FFN front half placed elsewhere: the hyper-connection mix for the FFN, the
+# collapse of the stream (hc_pre), ffn_norm, the gate and the experts' quantized input, as one
+# call. When set, Block.forward uses it (with no image mask) and enters the MoE routed.
+# ffn_front_fn(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
+#              norm_weight, norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp,
+#              norm_topk_prob, route_scale)
+#   -> (ffn_pre, ffn_post, ffn_comb, x_normed, x_in, weights, indices)
+ffn_front_fn = None
+
 
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, scale: torch.Tensor | None = None
@@ -1111,11 +1120,16 @@ class MoE(nn.Module):
         return self._quantized_input(h.to(torch.bfloat16))
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+        x2 = x.view(-1, self.dim)
+        weights, indices = self.gate(x2, None if image_mask is None else image_mask.flatten())
+        return self.forward_routed(x, self._quantized_input(x2), weights, indices)
+
+    def forward_routed(self, x: torch.Tensor, x_in: torch.Tensor, weights: torch.Tensor,
+                       indices: torch.Tensor) -> torch.Tensor:
+        """The MoE after its gate: x_in [n, dim] the quantized input, weights and indices [n, topk]."""
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
         n, topk = indices.shape
-        x_in = self._quantized_input(x)
         if self.experts_fn is not None:
             y = self.experts_fn(x_in, weights, indices, self.layer_id)
         elif self.routing == "batched":
@@ -1276,10 +1290,18 @@ class Block(nn.Module):
         x = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = x
-        ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = self.hc_pre(x, attn_pre)
-        x = self.ffn_norm(x)
-        x = self.ffn(x, image_mask)
+        gate = getattr(self.ffn, "gate", None)
+        if ffn_front_fn is not None and image_mask is None and gate is not None:
+            ffn_pre, ffn_post, ffn_comb, xn, x_in, weights, indices = ffn_front_fn(
+                x, attn_pre, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.hc_mult,
+                self.hc_sinkhorn_iters, self.hc_eps, self.ffn_norm.weight, self.ffn_norm.eps, gate.weight, gate.bias,
+                gate.topk, gate.score_func, gate.gate_temp, gate.norm_topk_prob, gate.route_scale)
+            x = self.ffn.forward_routed(xn, x_in, weights, indices)
+        else:
+            ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            x = self.hc_pre(x, attn_pre)
+            x = self.ffn_norm(x)
+            x = self.ffn(x, image_mask)
         x = self.hc_post(x, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 

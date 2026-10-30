@@ -208,6 +208,24 @@ ffn_front_fn = None
 # hc_front_fn(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps)
 #   -> (attn_pre, attn_post, attn_comb, x_normed)
 hc_front_fn = None
+# vxpu: the MoE's shared expert (Expert.forward: three fp8 linears and the SwiGLU) placed
+# elsewhere. When set, MoE.forward_routed calls
+# shared_ffn_fn(x, w1, w1_scale, w3, w3_scale, w2, w2_scale, swiglu_limit) for fp8 weights.
+shared_ffn_fn = None
+# vxpu: the attention's query path placed elsewhere: wq_a, q_norm, wq_b and the rotary of the
+# heads' rope tails as one call. When set, Attention.forward uses it for fp8 weights:
+# attn_q_fn(x, wq_a, wq_a_scale, q_norm_weight, q_norm_eps, wq_b, wq_b_scale, freqs_cis, n_heads,
+# head_dim, rope_head_dim) -> (qr normalized [b, s, rank], q rotated [b, s, n_heads * head_dim])
+attn_q_fn = None
+# vxpu: the attention's window key placed elsewhere: wkv, kv_norm, the rope tail's rotary and
+# act_quant as one call, window_kv_fn(x, wkv, wkv_scale, kv_norm_weight, kv_norm_eps, freqs_cis,
+# rope_head_dim) -> kv [b, s, head_dim] on the fp8 grid. When set, _window_kv uses it for fp8 weights.
+window_kv_fn = None
+# vxpu: the attention's output path placed elsewhere: the rope tails' inverse rotary, act_quant,
+# wo_a (grouped) and wo_b as one call, attn_out_fn(o, freqs_cis, wo_a, wo_a_scale, n_groups,
+# o_lora_rank, wo_b, wo_b_scale, rope_head_dim) -> [b, s, dim]. When set, Attention.forward uses
+# it for fp8 weights.
+attn_out_fn = None
 
 
 def linear(
@@ -859,9 +877,13 @@ class Attention(nn.Module):
         the length; each slot ends up holding the latest token that maps to it, as before.)"""
         bsz, seqlen, _ = x.size()
         win = self.window_size
-        kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
-        act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
+        if window_kv_fn is not None and self.wkv.weight.dtype == torch.float8_e4m3fn:
+            kv = window_kv_fn(x, self.wkv.weight, self.wkv.scale, self.kv_norm.weight, self.kv_norm.eps, freqs_cis,
+                              self.rope_head_dim)
+        else:
+            kv = self.kv_norm(self.wkv(x))
+            apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+            act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
         slots = self.window_slots
         if _is_prefill(start_pos):  # prefill: attend over this chunk, seeding the ring buffer for decode
             slot = torch.arange(slots, device=x.device)
@@ -931,15 +953,25 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[_positions(start_pos, seqlen, bsz, x.device)]
         rd = self.rope_head_dim
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        if (attn_q_fn is not None and self.wq_a.weight.dtype == torch.float8_e4m3fn
+                and self.wq_b.weight.dtype == torch.float8_e4m3fn):
+            qr, q = attn_q_fn(x, self.wq_a.weight, self.wq_a.scale, self.q_norm.weight, self.q_norm.eps,
+                              self.wq_b.weight, self.wq_b.scale, freqs_cis, self.n_local_heads, self.head_dim, rd)
+            q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        else:
+            qr = self.q_norm(self.wq_a(x))
+            q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+            apply_rotary_emb(q[..., -rd:], freqs_cis)
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        if (attn_out_fn is not None and self.wo_a.weight.dtype == torch.float8_e4m3fn
+                and self.wo_b.weight.dtype == torch.float8_e4m3fn):
+            return attn_out_fn(o, freqs_cis, self.wo_a.weight, self.wo_a.scale, self.n_local_groups, self.o_lora_rank,
+                               self.wo_b.weight, self.wo_b.scale, rd)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
@@ -1144,7 +1176,12 @@ class MoE(nn.Module):
             y = self._forward_grouped(x_in, weights, indices)
         if world_size > 1:
             dist.all_reduce(y)
-        y += self.shared_experts(x)
+        se = self.shared_experts
+        if shared_ffn_fn is not None and se.w1.weight.dtype == torch.float8_e4m3fn:
+            y += shared_ffn_fn(x, se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale, se.w2.weight, se.w2.scale,
+                               float(se.swiglu_limit))
+        else:
+            y += se(x)
         return y.type_as(x).view(shape)
 
     def _forward_batched(self, x_in, weights, indices):

@@ -203,6 +203,12 @@ grouped_linear_fn = None
 #   -> (ffn_pre, ffn_post, ffn_comb, x_normed, x_in, weights, indices)
 ffn_front_fn = None
 
+# vxpu: the same for the attention half, up to the normalized input of the attention: the mix for
+# the attention, the collapse of the stream (hc_pre) and attn_norm.
+# hc_front_fn(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps)
+#   -> (attn_pre, attn_post, attn_comb, x_normed)
+hc_front_fn = None
+
 
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, scale: torch.Tensor | None = None
@@ -1283,9 +1289,14 @@ class Block(nn.Module):
 
         image_mask: [b, s] bool, True inside image spans (selects the VL routing bias)."""
         residual = x
-        attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = self.hc_pre(x, pre_mix)
-        x = self.attn_norm(x)
+        if hc_front_fn is not None:
+            attn_pre, attn_post, attn_comb, x = hc_front_fn(
+                x, pre_mix, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.hc_mult,
+                self.hc_sinkhorn_iters, self.hc_eps, self.attn_norm.weight, self.attn_norm.eps)
+        else:
+            attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            x = self.hc_pre(x, pre_mix)
+            x = self.attn_norm(x)
         x = self.attn(x, start_pos, *attn_args)
         x = self.hc_post(x, residual, attn_post, attn_comb)
 

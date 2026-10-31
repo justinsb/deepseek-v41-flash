@@ -237,9 +237,15 @@ window_kv_fn = None
 # vxpu: the attention's output path placed elsewhere: the rope tails' inverse rotary, act_quant,
 # wo_a (grouped) and wo_b as one call, then the block's hc_post: attn_out_fn(o, freqs_cis_table,
 # start, seqlen, wo_a, wo_a_scale, n_groups, o_lora_rank, wo_b, wo_b_scale, rope_head_dim,
-# residual, post, comb) -> the block's new stream [b, s, hc, dim]. When set, Attention.forward
-# uses it for fp8 weights (Block.forward hands the mix in and skips its own hc_post).
+# residual, post, comb, prepared) -> the block's new stream [b, s, hc, dim]. When set,
+# Attention.forward uses it for fp8 weights (Block.forward hands the mix in and skips its own
+# hc_post); prepared says attn_core_fn already rotated and quantized o.
 attn_out_fn = None
+# vxpu: the sparse attention with the output path's first step placed elsewhere: attn_core_fn(q,
+# kv, attn_sink, topk_idxs, softmax_scale, freqs_cis_table, start, seqlen, rope_head_dim) -> o
+# [b, s, heads, head_dim] with the rope tails rotated back and each head on the fp8 grid, which
+# attn_out_fn then takes as prepared. When set with attn_out_fn, Attention.forward uses it.
+attn_core_fn = None
 
 
 def linear(
@@ -1011,12 +1017,17 @@ class Attention(nn.Module):
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         if self.places_output() and hc is not None:  # without hc (a caller of its own) the path below runs
             residual, post, comb = hc
+            prepared = attn_core_fn is not None
+            if prepared:  # the attention finishes the output path's first step itself
+                o = attn_core_fn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale, self.freqs_cis, start, seqlen, rd)
+            else:
+                o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
             return attn_out_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
                                self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd,
-                               residual, post, comb)
+                               residual, post, comb, prepared)
+        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis(), True)
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
@@ -1473,9 +1484,14 @@ class DSparkAttention(Attention):
             rows = torch.arange(bsz, device=main_x.device).view(bsz, 1).expand(bsz, seqlen)
             self.window_kv_cache[:bsz].index_put_((rows, positions % slots), main_kv)
 
-    def forward(self, x: torch.Tensor, start_pos):
+    def places_output(self) -> bool:
+        return False  # vxpu: the draft block's attention runs the published paths; the Block mixes the stream
+
+    def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None, hc=None):
         """The draft block, x [bsz, block, dim], each row's at its own positions from start_pos
-        (vxpu: [bsz]); it reads the ring that observe wrote, and does not write it."""
+        (vxpu: [bsz]); it reads the ring that observe wrote, and does not write it. (vxpu: x_in,
+        the quantized input the block's front may pass, is not used here; the published linears
+        quantize x themselves, to the same values.)"""
         bsz, block_size, _ = x.size()
         rd = self.rope_head_dim
         freqs_cis = self.freqs_cis[_positions(start_pos, block_size, bsz, x.device)]

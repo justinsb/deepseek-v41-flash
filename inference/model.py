@@ -219,6 +219,14 @@ hc_front_fn = None
 # and rounded as forward_routed does, then hc_post with the block's residual, post and comb.
 # Block.forward hands those in and skips its own hc_post.
 shared_ffn_fn = None
+# shared_ffn_front_fn(x_in, w1, w1_scale, w3, w3_scale, w2, w2_scale, swiglu_limit, quantized=True)
+# -> the shared expert's output [b, s, dim] (the published Expert's forward over x's fp8-grid values),
+# and shared_ffn_combine_fn(shared, y_experts, residual, post, comb) -> the block's new stream: the
+# same work as shared_ffn_fn in two calls, the first of which needs nothing from the routed experts
+# and so runs beside them; forward_routed calls the experts, then the front, then the combine.
+# With both set they take precedence over shared_ffn_fn.
+shared_ffn_front_fn = None
+shared_ffn_combine_fn = None
 # vxpu: the attention's query path placed elsewhere: wq_a, q_norm, wq_b and the rotary of the
 # heads' rope tails as one call. When set, Attention.forward uses it for fp8 weights:
 # attn_q_fn(x, wq_a, wq_a_scale, q_norm_weight, q_norm_eps, wq_b, wq_b_scale, freqs_cis_table,
@@ -1242,7 +1250,8 @@ class MoE(nn.Module):
     def places_shared(self) -> bool:
         """vxpu: whether the shared expert runs placed (shared_ffn_fn), in which case forward_routed
         takes the block's hc mix (hc=) and returns the new stream instead of the MoE's output."""
-        return shared_ffn_fn is not None and self.shared_experts.w1.weight.dtype == torch.float8_e4m3fn
+        placed = shared_ffn_fn is not None or (shared_ffn_front_fn is not None and shared_ffn_combine_fn is not None)
+        return placed and self.shared_experts.w1.weight.dtype == torch.float8_e4m3fn
 
     def forward_routed(self, x: torch.Tensor, x_in: torch.Tensor, weights: torch.Tensor,
                        indices: torch.Tensor, hc=None) -> torch.Tensor:
@@ -1263,8 +1272,16 @@ class MoE(nn.Module):
         se = self.shared_experts
         if self.places_shared() and hc is not None:  # without hc (MoE.forward) the published expert runs
             residual, post, comb = hc
-            # x_in is x on the fp8 grid, which is what the published Expert's linears compute from x; the
-            # placed op adds y (the routed experts' fp32 sum), rounds as below and mixes the stream
+            # x_in is x on the fp8 grid, which is what the published Expert's linears compute from x
+            if shared_ffn_front_fn is not None and shared_ffn_combine_fn is not None:
+                # the shared expert after the routed experts in program order, so that the exported graph
+                # places it after their node and the executor runs the two beside each other: its front
+                # reads only x_in; the combine adds y (the routed experts' fp32 sum), rounds as below and
+                # mixes the stream
+                shared = shared_ffn_front_fn(x_in.view(shape), se.w1.weight, se.w1.scale, se.w3.weight,
+                                             se.w3.scale, se.w2.weight, se.w2.scale, float(se.swiglu_limit), True)
+                return shared_ffn_combine_fn(shared, y.float().view(shape), residual, post, comb)
+            # one placed op: adds y, rounds as below and mixes the stream
             return shared_ffn_fn(x_in.view(shape), se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale,
                                  se.w2.weight, se.w2.scale, float(se.swiglu_limit), True, y.float().view(shape),
                                  residual, post, comb)

@@ -212,9 +212,12 @@ ffn_front_fn = None
 hc_front_fn = None
 # vxpu: the MoE's shared expert (Expert.forward: three fp8 linears and the SwiGLU) placed
 # elsewhere. When set, MoE.forward_routed calls
-# shared_ffn_fn(x_in, w1, w1_scale, w3, w3_scale, w2, w2_scale, swiglu_limit, quantized=True) for
-# fp8 weights, with x_in the MoE's quantized input (act_quant is idempotent: the same values the
-# published Expert computes from x, one quantization fewer).
+# shared_ffn_fn(x_in, w1, w1_scale, w3, w3_scale, w2, w2_scale, swiglu_limit, quantized=True,
+# y_experts, residual, post, comb) -> the block's new stream [b, s, hc, dim], for fp8 weights:
+# the shared expert over x_in (the MoE's quantized input; act_quant is idempotent, so the same
+# values the published Expert computes from x), added to the routed experts' fp32 sum y_experts
+# and rounded as forward_routed does, then hc_post with the block's residual, post and comb.
+# Block.forward hands those in and skips its own hc_post.
 shared_ffn_fn = None
 # vxpu: the attention's query path placed elsewhere: wq_a, q_norm, wq_b and the rotary of the
 # heads' rope tails as one call. When set, Attention.forward uses it for fp8 weights:
@@ -232,9 +235,10 @@ attn_q_fn = None
 # grid. When set, _window_kv uses it for fp8 weights.
 window_kv_fn = None
 # vxpu: the attention's output path placed elsewhere: the rope tails' inverse rotary, act_quant,
-# wo_a (grouped) and wo_b as one call, attn_out_fn(o, freqs_cis_table, start, seqlen, wo_a,
-# wo_a_scale, n_groups, o_lora_rank, wo_b, wo_b_scale, rope_head_dim) -> [b, s, dim]. When set,
-# Attention.forward uses it for fp8 weights.
+# wo_a (grouped) and wo_b as one call, then the block's hc_post: attn_out_fn(o, freqs_cis_table,
+# start, seqlen, wo_a, wo_a_scale, n_groups, o_lora_rank, wo_b, wo_b_scale, rope_head_dim,
+# residual, post, comb) -> the block's new stream [b, s, hc, dim]. When set, Attention.forward
+# uses it for fp8 weights (Block.forward hands the mix in and skips its own hc_post).
 attn_out_fn = None
 
 
@@ -970,11 +974,19 @@ class Attention(nn.Module):
         # read after the write, so this does not depend on the slice aliasing the cache
         return shared_attn.compress_kv[:bsz], idxs
 
-    def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None):
+    def places_output(self) -> bool:
+        """vxpu: whether the output path runs placed (attn_out_fn), in which case forward takes the
+        block's hc mix (hc=) and returns the new stream instead of the sublayer output."""
+        return (attn_out_fn is not None and self.wo_a.weight.dtype == torch.float8_e4m3fn
+                and self.wo_b.weight.dtype == torch.float8_e4m3fn)
+
+    def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None, hc=None):
         """vxpu: x_in is x on the fp8 grid when the block's front produced it (hc_front_fn); the
         placed projections take it instead of quantizing x again. The rotary frequencies are
         gathered from the table only for the paths that run here; the placed ops read the table
-        at the rows' positions themselves (start, seqlen)."""
+        at the rows' positions themselves (start, seqlen). With hc = (residual, post, comb) and
+        places_output(), the placed output path also does the block's hc_post and the result is
+        the new stream [b, s, hc, dim]."""
         bsz, seqlen, _ = x.size()
         start = _start_rows(start_pos, bsz, x.device)
         gathered = []
@@ -1000,10 +1012,11 @@ class Attention(nn.Module):
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
-        if (attn_out_fn is not None and self.wo_a.weight.dtype == torch.float8_e4m3fn
-                and self.wo_b.weight.dtype == torch.float8_e4m3fn):
+        if self.places_output() and hc is not None:  # without hc (a caller of its own) the path below runs
+            residual, post, comb = hc
             return attn_out_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
-                               self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd)
+                               self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd,
+                               residual, post, comb)
         apply_rotary_emb(o[..., -rd:], freqs_cis(), True)
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
@@ -1194,9 +1207,16 @@ class MoE(nn.Module):
         weights, indices = self.gate(x2, None if image_mask is None else image_mask.flatten())
         return self.forward_routed(x, self._quantized_input(x2), weights, indices)
 
+    def places_shared(self) -> bool:
+        """vxpu: whether the shared expert runs placed (shared_ffn_fn), in which case forward_routed
+        takes the block's hc mix (hc=) and returns the new stream instead of the MoE's output."""
+        return shared_ffn_fn is not None and self.shared_experts.w1.weight.dtype == torch.float8_e4m3fn
+
     def forward_routed(self, x: torch.Tensor, x_in: torch.Tensor, weights: torch.Tensor,
-                       indices: torch.Tensor) -> torch.Tensor:
-        """The MoE after its gate: x_in [n, dim] the quantized input, weights and indices [n, topk]."""
+                       indices: torch.Tensor, hc=None) -> torch.Tensor:
+        """The MoE after its gate: x_in [n, dim] the quantized input, weights and indices [n, topk].
+        (vxpu: with hc = (residual, post, comb) and places_shared(), the placed shared expert adds
+        the routed sum and does the block's hc_post, returning the new stream [b, s, hc, dim].)"""
         shape = x.size()
         x = x.view(-1, self.dim)
         n, topk = indices.shape
@@ -1209,12 +1229,14 @@ class MoE(nn.Module):
         if world_size > 1:
             dist.all_reduce(y)
         se = self.shared_experts
-        if shared_ffn_fn is not None and se.w1.weight.dtype == torch.float8_e4m3fn:
-            # x_in is x on the fp8 grid, which is what the published Expert's linears compute from x
-            y += shared_ffn_fn(x_in.view(x.shape), se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale, se.w2.weight,
-                               se.w2.scale, float(se.swiglu_limit), True)
-        else:
-            y += se(x)
+        if self.places_shared() and hc is not None:  # without hc (MoE.forward) the published expert runs
+            residual, post, comb = hc
+            # x_in is x on the fp8 grid, which is what the published Expert's linears compute from x; the
+            # placed op adds y (the routed experts' fp32 sum), rounds as below and mixes the stream
+            return shared_ffn_fn(x_in.view(shape), se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale,
+                                 se.w2.weight, se.w2.scale, float(se.swiglu_limit), True, y.float().view(shape),
+                                 residual, post, comb)
+        y += se(x)
         return y.type_as(x).view(shape)
 
     def _forward_batched(self, x_in, weights, indices):
@@ -1368,8 +1390,11 @@ class Block(nn.Module):
             attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
             x = self.hc_pre(x, pre_mix)
             x = self.attn_norm(x)
-        x = self.attn(x, start_pos, *attn_args, x_in=x_in)
-        x = self.hc_post(x, residual, attn_post, attn_comb)
+        if self.attn.places_output():  # the placed output path mixes the stream itself
+            x = self.attn(x, start_pos, *attn_args, x_in=x_in, hc=(residual, attn_post, attn_comb))
+        else:
+            x = self.attn(x, start_pos, *attn_args, x_in=x_in)
+            x = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = x
         gate = getattr(self.ffn, "gate", None)
@@ -1378,6 +1403,8 @@ class Block(nn.Module):
                 x, attn_pre, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.hc_mult,
                 self.hc_sinkhorn_iters, self.hc_eps, self.ffn_norm.weight, self.ffn_norm.eps, gate.weight, gate.bias,
                 gate.topk, gate.score_func, gate.gate_temp, gate.norm_topk_prob, gate.route_scale)
+            if self.ffn.places_shared():  # the placed shared expert mixes the stream itself
+                return self.ffn.forward_routed(xn, x_in, weights, indices, hc=(residual, ffn_post, ffn_comb)), ffn_pre
             x = self.ffn.forward_routed(xn, x_in, weights, indices)
         else:
             ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)

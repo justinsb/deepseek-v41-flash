@@ -246,6 +246,12 @@ attn_out_fn = None
 # [b, s, heads, head_dim] with the rope tails rotated back and each head on the fp8 grid, which
 # attn_out_fn then takes as prepared. When set with attn_out_fn, Attention.forward uses it.
 attn_core_fn = None
+# vxpu: attn_core_fn over the two caches with the selection formed inside: attn_select_fn(q,
+# window_kv_cache[:b], compress_kv, attn_sink, compress_idxs, softmax_scale, freqs_cis_table,
+# start, seqlen, rope_head_dim, window_size, prefill) -> o as attn_core_fn's. When set (with
+# attn_out_fn), Attention.forward uses it and builds neither the window's ids nor the
+# concatenated KV; for a layer without compression compress_kv and compress_idxs are empty.
+attn_select_fn = None
 
 
 def linear(
@@ -899,7 +905,7 @@ class Attention(nn.Module):
         self.freqs_cis: torch.Tensor
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def _window_kv(self, x, x_in, start, freqs_cis, start_pos):
+    def _window_kv(self, x, x_in, start, freqs_cis, start_pos, select_ids=True):
         """This layer's sliding-window K and the window positions every query may attend to. The K
         stays fp8, quantized over the whole post-RoPE vector, RoPE tail included.
         (vxpu: the ring buffer is seeded with a gather per slot instead of two Python branches on
@@ -927,6 +933,8 @@ class Attention(nn.Module):
             rows = torch.arange(bsz, device=x.device).view(bsz, 1).expand(bsz, seqlen)
             self.window_kv_cache[:bsz].index_put_((rows, positions % slots), kv)
             window_kv = self.window_kv_cache[:bsz]
+        if select_ids is False:  # vxpu: the placed attention forms the window's selection itself
+            return window_kv, None
         return window_kv, get_window_topk_idxs(win, slots, bsz, seqlen, start_pos, x.device)
 
     def _compress_topk_idxs(self, x, qr, latent, ready, start_pos, offset):
@@ -1012,7 +1020,20 @@ class Attention(nn.Module):
             qr = self.q_norm(self.wq_a(x))
             q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
             apply_rotary_emb(q[..., -rd:], freqs_cis())
-        kv, topk_idxs = self._window_kv(x, x_in, start, freqs_cis, start_pos)
+        selecting = attn_select_fn is not None and self.places_output() and hc is not None
+        kv, topk_idxs = self._window_kv(x, x_in, start, freqs_cis, start_pos, select_ids=not selecting)
+        if selecting:  # the placed attention reads both caches and forms the window's selection itself
+            if self.compress_ratio:  # offset 0: the compressed selection indexes the compressed cache itself
+                compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, 0)
+            else:
+                compress_kv = kv.new_empty(bsz, 0, kv.size(-1))
+                compress_idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
+            residual, post, comb = hc
+            o = attn_select_fn(q, kv, compress_kv, self.attn_sink, compress_idxs, self.softmax_scale, self.freqs_cis,
+                               start, seqlen, rd, self.window_size, _is_prefill(start_pos))
+            return attn_out_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
+                               self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd,
+                               residual, post, comb, True)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)

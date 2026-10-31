@@ -206,25 +206,35 @@ ffn_front_fn = None
 # vxpu: the same for the attention half, up to the normalized input of the attention: the mix for
 # the attention, the collapse of the stream (hc_pre) and attn_norm.
 # hc_front_fn(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps)
-#   -> (attn_pre, attn_post, attn_comb, x_normed)
+#   -> (attn_pre, attn_post, attn_comb, x_normed, x_in)
+# x_in is x_normed on the fp8 grid (act_quant), the attention's projections' input: they take it
+# as already quantized instead of quantizing x_normed again each.
 hc_front_fn = None
 # vxpu: the MoE's shared expert (Expert.forward: three fp8 linears and the SwiGLU) placed
 # elsewhere. When set, MoE.forward_routed calls
-# shared_ffn_fn(x, w1, w1_scale, w3, w3_scale, w2, w2_scale, swiglu_limit) for fp8 weights.
+# shared_ffn_fn(x_in, w1, w1_scale, w3, w3_scale, w2, w2_scale, swiglu_limit, quantized=True) for
+# fp8 weights, with x_in the MoE's quantized input (act_quant is idempotent: the same values the
+# published Expert computes from x, one quantization fewer).
 shared_ffn_fn = None
 # vxpu: the attention's query path placed elsewhere: wq_a, q_norm, wq_b and the rotary of the
 # heads' rope tails as one call. When set, Attention.forward uses it for fp8 weights:
-# attn_q_fn(x, wq_a, wq_a_scale, q_norm_weight, q_norm_eps, wq_b, wq_b_scale, freqs_cis, n_heads,
-# head_dim, rope_head_dim) -> (qr normalized [b, s, rank], q rotated [b, s, n_heads * head_dim])
+# attn_q_fn(x, wq_a, wq_a_scale, q_norm_weight, q_norm_eps, wq_b, wq_b_scale, freqs_cis_table,
+# start, seqlen, n_heads, head_dim, rope_head_dim, quantized)
+#   -> (qr normalized [b, s, rank], q rotated [b, s, n_heads * head_dim])
+# freqs_cis_table is the whole table (Attention.freqs_cis); token t of row b sits at position
+# start[b] + t (start [b] int64: _pos for a decode step, zeros for a prefill), so the callee
+# reads the frequencies in place instead of this module gathering them first. quantized says x
+# is x_in, already on the fp8 grid.
 attn_q_fn = None
 # vxpu: the attention's window key placed elsewhere: wkv, kv_norm, the rope tail's rotary and
-# act_quant as one call, window_kv_fn(x, wkv, wkv_scale, kv_norm_weight, kv_norm_eps, freqs_cis,
-# rope_head_dim) -> kv [b, s, head_dim] on the fp8 grid. When set, _window_kv uses it for fp8 weights.
+# act_quant as one call, window_kv_fn(x, wkv, wkv_scale, kv_norm_weight, kv_norm_eps,
+# freqs_cis_table, start, seqlen, rope_head_dim, quantized) -> kv [b, s, head_dim] on the fp8
+# grid. When set, _window_kv uses it for fp8 weights.
 window_kv_fn = None
 # vxpu: the attention's output path placed elsewhere: the rope tails' inverse rotary, act_quant,
-# wo_a (grouped) and wo_b as one call, attn_out_fn(o, freqs_cis, wo_a, wo_a_scale, n_groups,
-# o_lora_rank, wo_b, wo_b_scale, rope_head_dim) -> [b, s, dim]. When set, Attention.forward uses
-# it for fp8 weights.
+# wo_a (grouped) and wo_b as one call, attn_out_fn(o, freqs_cis_table, start, seqlen, wo_a,
+# wo_a_scale, n_groups, o_lora_rank, wo_b, wo_b_scale, rope_head_dim) -> [b, s, dim]. When set,
+# Attention.forward uses it for fp8 weights.
 attn_out_fn = None
 
 
@@ -521,6 +531,15 @@ def _pos(start_pos, device, bsz) -> torch.Tensor:
     pos = start_pos if torch.is_tensor(start_pos) else torch.tensor(start_pos)
     pos = pos.to(device=device, dtype=torch.long).reshape(-1)
     return pos.expand(bsz) if pos.numel() == 1 else pos
+
+
+def _start_rows(start_pos, bsz, device) -> torch.Tensor:
+    """vxpu: each row's first position in this forward, [bsz] int64: zeros for a prefill, the
+    step's positions for a decode step. Token t of row b sits at _start_rows[b] + t, which is
+    _positions(...)[b, t]; the placed ops take this and index the rotary table themselves."""
+    if _is_prefill(start_pos):
+        return torch.zeros(bsz, dtype=torch.long, device=device)
+    return _pos(start_pos, device, bsz)
 
 
 def _positions(start_pos, seqlen, bsz, device) -> torch.Tensor:
@@ -870,19 +889,21 @@ class Attention(nn.Module):
         self.freqs_cis: torch.Tensor
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def _window_kv(self, x, freqs_cis, start_pos):
+    def _window_kv(self, x, x_in, start, freqs_cis, start_pos):
         """This layer's sliding-window K and the window positions every query may attend to. The K
         stays fp8, quantized over the whole post-RoPE vector, RoPE tail included.
         (vxpu: the ring buffer is seeded with a gather per slot instead of two Python branches on
-        the length; each slot ends up holding the latest token that maps to it, as before.)"""
+        the length; each slot ends up holding the latest token that maps to it, as before. x_in is
+        x on the fp8 grid when the block's front produced it, start the rows' first positions,
+        freqs_cis a function giving the gathered frequencies when a path needs them.)"""
         bsz, seqlen, _ = x.size()
         win = self.window_size
         if window_kv_fn is not None and self.wkv.weight.dtype == torch.float8_e4m3fn:
-            kv = window_kv_fn(x, self.wkv.weight, self.wkv.scale, self.kv_norm.weight, self.kv_norm.eps, freqs_cis,
-                              self.rope_head_dim)
+            kv = window_kv_fn(x if x_in is None else x_in, self.wkv.weight, self.wkv.scale, self.kv_norm.weight,
+                              self.kv_norm.eps, self.freqs_cis, start, seqlen, self.rope_head_dim, x_in is not None)
         else:
             kv = self.kv_norm(self.wkv(x))
-            apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+            apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis())
             act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
         slots = self.window_slots
         if _is_prefill(start_pos):  # prefill: attend over this chunk, seeding the ring buffer for decode
@@ -949,20 +970,31 @@ class Attention(nn.Module):
         # read after the write, so this does not depend on the slice aliasing the cache
         return shared_attn.compress_kv[:bsz], idxs
 
-    def forward(self, x: torch.Tensor, start_pos):
+    def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None):
+        """vxpu: x_in is x on the fp8 grid when the block's front produced it (hc_front_fn); the
+        placed projections take it instead of quantizing x again. The rotary frequencies are
+        gathered from the table only for the paths that run here; the placed ops read the table
+        at the rows' positions themselves (start, seqlen)."""
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[_positions(start_pos, seqlen, bsz, x.device)]
+        start = _start_rows(start_pos, bsz, x.device)
+        gathered = []
+
+        def freqs_cis():  # the gathered frequencies, once, for the paths computed here
+            if not gathered:
+                gathered.append(self.freqs_cis[_positions(start_pos, seqlen, bsz, x.device)])
+            return gathered[0]
         rd = self.rope_head_dim
         if (attn_q_fn is not None and self.wq_a.weight.dtype == torch.float8_e4m3fn
                 and self.wq_b.weight.dtype == torch.float8_e4m3fn):
-            qr, q = attn_q_fn(x, self.wq_a.weight, self.wq_a.scale, self.q_norm.weight, self.q_norm.eps,
-                              self.wq_b.weight, self.wq_b.scale, freqs_cis, self.n_local_heads, self.head_dim, rd)
+            qr, q = attn_q_fn(x if x_in is None else x_in, self.wq_a.weight, self.wq_a.scale, self.q_norm.weight,
+                              self.q_norm.eps, self.wq_b.weight, self.wq_b.scale, self.freqs_cis, start, seqlen,
+                              self.n_local_heads, self.head_dim, rd, x_in is not None)
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         else:
             qr = self.q_norm(self.wq_a(x))
             q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-            apply_rotary_emb(q[..., -rd:], freqs_cis)
-        kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+            apply_rotary_emb(q[..., -rd:], freqs_cis())
+        kv, topk_idxs = self._window_kv(x, x_in, start, freqs_cis, start_pos)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
@@ -970,9 +1002,9 @@ class Attention(nn.Module):
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         if (attn_out_fn is not None and self.wo_a.weight.dtype == torch.float8_e4m3fn
                 and self.wo_b.weight.dtype == torch.float8_e4m3fn):
-            return attn_out_fn(o, freqs_cis, self.wo_a.weight, self.wo_a.scale, self.n_local_groups, self.o_lora_rank,
-                               self.wo_b.weight, self.wo_b.scale, rd)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+            return attn_out_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
+                               self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd)
+        apply_rotary_emb(o[..., -rd:], freqs_cis(), True)
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
@@ -1178,8 +1210,9 @@ class MoE(nn.Module):
             dist.all_reduce(y)
         se = self.shared_experts
         if shared_ffn_fn is not None and se.w1.weight.dtype == torch.float8_e4m3fn:
-            y += shared_ffn_fn(x, se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale, se.w2.weight, se.w2.scale,
-                               float(se.swiglu_limit))
+            # x_in is x on the fp8 grid, which is what the published Expert's linears compute from x
+            y += shared_ffn_fn(x_in.view(x.shape), se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale, se.w2.weight,
+                               se.w2.scale, float(se.swiglu_limit), True)
         else:
             y += se(x)
         return y.type_as(x).view(shape)
@@ -1326,15 +1359,16 @@ class Block(nn.Module):
 
         image_mask: [b, s] bool, True inside image spans (selects the VL routing bias)."""
         residual = x
+        x_in = None
         if hc_front_fn is not None:
-            attn_pre, attn_post, attn_comb, x = hc_front_fn(
+            attn_pre, attn_post, attn_comb, x, x_in = hc_front_fn(
                 x, pre_mix, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.hc_mult,
                 self.hc_sinkhorn_iters, self.hc_eps, self.attn_norm.weight, self.attn_norm.eps)
         else:
             attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
             x = self.hc_pre(x, pre_mix)
             x = self.attn_norm(x)
-        x = self.attn(x, start_pos, *attn_args)
+        x = self.attn(x, start_pos, *attn_args, x_in=x_in)
         x = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = x

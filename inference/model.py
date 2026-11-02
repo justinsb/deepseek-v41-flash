@@ -260,6 +260,12 @@ attn_core_fn = None
 # attn_out_fn), Attention.forward uses it and builds neither the window's ids nor the
 # concatenated KV; for a layer without compression compress_kv and compress_idxs are empty.
 attn_select_fn = None
+# vxpu: under tensor parallelism, the output path without the block's mix: attn_out_partial_fn(o,
+# freqs_cis_table, start, seqlen, wo_a, wo_a_scale, n_local_groups, o_lora_rank, wo_b, wo_b_scale,
+# rope_head_dim, prepared) -> this rank's partial of the projection [b, s, dim], which the ranks'
+# all_reduce sums; the block does hc_post. When set with attn_select_fn and world_size > 1,
+# Attention.forward uses the two in place of its own path.
+attn_out_partial_fn = None
 
 
 def linear(
@@ -1029,6 +1035,9 @@ class Attention(nn.Module):
             q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
             apply_rotary_emb(q[..., -rd:], freqs_cis())
         selecting = attn_select_fn is not None and self.places_output() and hc is not None
+        partial = (world_size > 1 and attn_select_fn is not None and attn_out_partial_fn is not None
+                   and self.wo_a.weight.dtype == torch.float8_e4m3fn and self.wo_b.weight.dtype == torch.float8_e4m3fn)
+        selecting = selecting or partial
         kv, topk_idxs = self._window_kv(x, x_in, start, freqs_cis, start_pos, select_ids=not selecting)
         if selecting:  # the placed attention reads both caches and forms the window's selection itself
             if self.compress_ratio:  # offset 0: the compressed selection indexes the compressed cache itself
@@ -1036,9 +1045,16 @@ class Attention(nn.Module):
             else:
                 compress_kv = kv.new_empty(bsz, 0, kv.size(-1))
                 compress_idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
-            residual, post, comb = hc
             o = attn_select_fn(q, kv, compress_kv, self.attn_sink, compress_idxs, self.softmax_scale, self.freqs_cis,
                                start, seqlen, rd, self.window_size, _is_prefill(start_pos))
+            if partial:  # this rank's heads and slices: a partial the ranks sum (in fp32, as RowParallelLinear
+                # does); the block mixes the stream
+                part = attn_out_partial_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
+                                           self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale,
+                                           rd, True).float()
+                dist.all_reduce(part)
+                return part.type_as(x)
+            residual, post, comb = hc
             return attn_out_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
                                self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd,
                                residual, post, comb, True)

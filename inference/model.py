@@ -1267,9 +1267,22 @@ class MoE(nn.Module):
             y = self._forward_batched(x_in, weights, indices)
         else:
             y = self._forward_grouped(x_in, weights, indices)
-        if world_size > 1:
-            dist.all_reduce(y)
         se = self.shared_experts
+        if world_size > 1:
+            if shared_ffn_front_fn is not None and se.w1.weight.dtype == torch.float8_e4m3fn:
+                # vxpu: under tensor parallelism the shared expert is split like a column- then
+                # row-parallel pair (parallel_slices: this rank's rows of w1 and w3, its columns of
+                # w2), so its placed front gives a partial of its output, and that partial joins the
+                # routed experts' partial in their one all_reduce instead of every rank computing the
+                # whole shared expert (hero run 15: a quarter of its weights a card, and the fused
+                # dual GEMV in place of three linears and their glue). The rounding differs from the
+                # published path by the partials' bf16 rounding before the fp32 sum.
+                shared = shared_ffn_front_fn(x_in.view(shape), se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale,
+                                             se.w2.weight, se.w2.scale, float(se.swiglu_limit), True)
+                y = y + shared.float().view(n, self.dim)
+                dist.all_reduce(y)
+                return y.type_as(x).view(shape)
+            dist.all_reduce(y)
         if self.places_shared() and hc is not None:  # without hc (MoE.forward) the published expert runs
             residual, post, comb = hc
             # x_in is x on the fp8 grid, which is what the published Expert's linears compute from x

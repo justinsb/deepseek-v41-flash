@@ -266,6 +266,11 @@ attn_select_fn = None
 # all_reduce sums; the block does hc_post. When set with attn_select_fn and world_size > 1,
 # Attention.forward uses the two in place of its own path.
 attn_out_partial_fn = None
+# vxpu: under tensor parallelism, the ranks' sum of a partial with the block's hc_post after it:
+# tp_allreduce_hc_fn(x_partial fp32 [b, s, dim], residual, post, comb) -> the block's new stream
+# [b, s, hc, dim]. When set with the partial paths above, Block.forward hands the mix to the
+# attention and the MoE and skips its own hc_post.
+tp_allreduce_hc_fn = None
 
 
 def linear(
@@ -1008,6 +1013,14 @@ class Attention(nn.Module):
         return (attn_out_fn is not None and self.wo_a.weight.dtype == torch.float8_e4m3fn
                 and self.wo_b.weight.dtype == torch.float8_e4m3fn)
 
+    def places_partial(self) -> bool:
+        """vxpu: whether, under tensor parallelism, the output path runs to this rank's partial
+        (attn_select_fn, attn_out_partial_fn) and the ranks' sum mixes the stream (tp_allreduce_hc_fn),
+        in which case forward takes the block's hc mix (hc=) and returns the new stream."""
+        return (world_size > 1 and attn_select_fn is not None and attn_out_partial_fn is not None
+                and tp_allreduce_hc_fn is not None and self.wo_a.weight.dtype == torch.float8_e4m3fn
+                and self.wo_b.weight.dtype == torch.float8_e4m3fn)
+
     def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None, hc=None):
         """vxpu: x_in is x on the fp8 grid when the block's front produced it (hc_front_fn); the
         placed projections take it instead of quantizing x again. The rotary frequencies are
@@ -1052,6 +1065,9 @@ class Attention(nn.Module):
                 part = attn_out_partial_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
                                            self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale,
                                            rd, True).float()
+                if tp_allreduce_hc_fn is not None and hc is not None:  # the sum mixes the stream itself
+                    residual, post, comb = hc
+                    return tp_allreduce_hc_fn(part, residual, post, comb)
                 dist.all_reduce(part)
                 return part.type_as(x)
             residual, post, comb = hc
@@ -1269,6 +1285,13 @@ class MoE(nn.Module):
         placed = shared_ffn_fn is not None or (shared_ffn_front_fn is not None and shared_ffn_combine_fn is not None)
         return placed and self.shared_experts.w1.weight.dtype == torch.float8_e4m3fn
 
+    def places_partial(self) -> bool:
+        """vxpu: whether, under tensor parallelism, the shared expert's partial joins the routed
+        experts' (shared_ffn_front_fn) and the ranks' sum mixes the stream (tp_allreduce_hc_fn), in
+        which case forward_routed takes the block's hc mix (hc=) and returns the new stream."""
+        return (world_size > 1 and shared_ffn_front_fn is not None and tp_allreduce_hc_fn is not None
+                and self.shared_experts.w1.weight.dtype == torch.float8_e4m3fn)
+
     def forward_routed(self, x: torch.Tensor, x_in: torch.Tensor, weights: torch.Tensor,
                        indices: torch.Tensor, hc=None) -> torch.Tensor:
         """The MoE after its gate: x_in [n, dim] the quantized input, weights and indices [n, topk].
@@ -1296,6 +1319,9 @@ class MoE(nn.Module):
                 shared = shared_ffn_front_fn(x_in.view(shape), se.w1.weight, se.w1.scale, se.w3.weight, se.w3.scale,
                                              se.w2.weight, se.w2.scale, float(se.swiglu_limit), True)
                 y = y + shared.float().view(n, self.dim)
+                if tp_allreduce_hc_fn is not None and hc is not None:  # the sum mixes the stream itself
+                    residual, post, comb = hc
+                    return tp_allreduce_hc_fn(y.view(shape), residual, post, comb)
                 dist.all_reduce(y)
                 return y.type_as(x).view(shape)
             dist.all_reduce(y)
@@ -1468,7 +1494,7 @@ class Block(nn.Module):
             attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
             x = self.hc_pre(x, pre_mix)
             x = self.attn_norm(x)
-        if self.attn.places_output():  # the placed output path mixes the stream itself
+        if self.attn.places_output() or self.attn.places_partial():  # the placed output path mixes the stream itself
             x = self.attn(x, start_pos, *attn_args, x_in=x_in, hc=(residual, attn_post, attn_comb))
         else:
             x = self.attn(x, start_pos, *attn_args, x_in=x_in)
@@ -1481,7 +1507,7 @@ class Block(nn.Module):
                 x, attn_pre, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.hc_mult,
                 self.hc_sinkhorn_iters, self.hc_eps, self.ffn_norm.weight, self.ffn_norm.eps, gate.weight, gate.bias,
                 gate.topk, gate.score_func, gate.gate_temp, gate.norm_topk_prob, gate.route_scale)
-            if self.ffn.places_shared():  # the placed shared expert mixes the stream itself
+            if self.ffn.places_shared() or self.ffn.places_partial():  # the placed tail mixes the stream itself
                 return self.ffn.forward_routed(xn, x_in, weights, indices, hc=(residual, ffn_post, ffn_comb)), ffn_pre
             x = self.ffn.forward_routed(xn, x_in, weights, indices)
         else:

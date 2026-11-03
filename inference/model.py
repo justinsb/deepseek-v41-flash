@@ -172,7 +172,16 @@ class ParallelEmbedding(nn.Module):
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
 
+    # vxpu: the rows fetched across the ranks' shards without a collective. When set under tensor
+    # parallelism, forward calls rows_fn(ids, shard, vocab_start) instead of the masked lookup and
+    # the all_reduce of one real row among zeros; the exporter sets it so the traced graph carries
+    # one call, and the runtime answers it by reading the row from the owning rank's shard (hero
+    # run 15: the drafter's call paid this sum once a call at full width, 37 us at 8 rows).
+    rows_fn = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if world_size > 1 and ParallelEmbedding.rows_fn is not None:
+            return ParallelEmbedding.rows_fn(x, self.weight, self.vocab_start_idx)
         if world_size > 1:
             # ids off this rank read row 0 then get zeroed, so the all_reduce sums one real row
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)

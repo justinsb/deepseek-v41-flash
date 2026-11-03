@@ -1898,7 +1898,8 @@ class Transformer(nn.Module):
         ids, confs = [output_ids], [confidence]
         for p in range(1, passes):
             x = self.mtp[-1].hc_pre(h, pre_mix)  # [bsz, block, dim]: the stages' states at this block's positions
-            main_x = self.mtp[0].forward_main(torch.cat([x, x], dim=-1))
+            copies = self.mtp[0].main_proj.in_features // x.size(-1)  # one per target layer the projection takes
+            main_x = self.mtp[0].forward_main(torch.cat([x] * copies, dim=-1))
             pos = _pos(start_pos, h.device, h.size(0)) + p * block - (block - 1)  # the block's first drafted position
             for layer in self.mtp:
                 layer.attn.observe(main_x[:, 1:], pos)  # positions after the input token, before the next block

@@ -1626,11 +1626,37 @@ class DSparkAttention(Attention):
         return x
 
 
+class _ReplicatedEmbedding(nn.Module):
+    """vxpu: an embedding whole on every rank (the same math as ParallelEmbedding's, no exchange)."""
+
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(vocab_size, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.embedding(x, self.weight)
+
+
+class _ReplicatedHead(nn.Module):
+    """vxpu: a head whole on every rank (ParallelHead's math, fp32 logits, no gather)."""
+
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor, full_logits=False):
+        if not full_logits:
+            x = x[:, -1]
+        return F.linear(x.float(), self.weight)
+
+
 class DSparkMarkovHead(nn.Module):
     def __init__(self, vocab_size: int, dspark_markov_rank: int):
         super().__init__()
-        self.embed = ParallelEmbedding(vocab_size, dspark_markov_rank)
-        self.head = ParallelHead(vocab_size, dspark_markov_rank)
+        # vxpu: whole on every rank (33 MB tables): under tensor parallelism the parallel modules cost the
+        # drafter a gather and a sum per Markov step, five a call, more than the bytes they save (hero run 15)
+        self.embed = _ReplicatedEmbedding(vocab_size, dspark_markov_rank)
+        self.head = _ReplicatedHead(vocab_size, dspark_markov_rank)
 
     def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         embed = self.embed(token_ids)

@@ -1595,6 +1595,9 @@ class DSparkAttention(Attention):
     def places_output(self) -> bool:
         return False  # vxpu: the draft block's attention runs the published paths; the Block mixes the stream
 
+    def places_partial(self) -> bool:  # vxpu: the stream-mixing sum takes the main blocks' [b, s, hc, dim] stream
+        return False
+
     def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None, hc=None):
         """The draft block, x [bsz, block, dim], each row's at its own positions from start_pos
         (vxpu: [bsz]); it reads the ring that observe wrote, and does not write it. (vxpu: x_in,

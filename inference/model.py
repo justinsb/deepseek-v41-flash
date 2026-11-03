@@ -1669,6 +1669,12 @@ class DSparkBlock(Block):
         self.head: ParallelHead | None = None
         self.head8: ParallelHead | None = None  # vxpu: an fp8 head of the drafter's own (ModelArgs.dspark_head_fp8)
 
+    def places_shared(self) -> bool:  # vxpu: the placed fronts take the main blocks' [b, s, hc, dim] stream
+        return False
+
+    def places_partial(self) -> bool:
+        return False
+
     def forward(self, x: torch.Tensor, start_pos, pre_mix: torch.Tensor):
         return super().forward(x, start_pos, pre_mix, None)  # drafts are text: no VL bias
 

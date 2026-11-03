@@ -272,6 +272,7 @@ attn_out_partial_fn = None
 # [b, s, hc, dim]. When set with the partial paths above, Block.forward hands the mix to the
 # attention and the MoE and skips its own hc_post.
 tp_allreduce_hc_fn = None
+argmax_fn = None  # vxpu: argmax over the last dim outside the compiler's fusion (sample at temperature 0)
 
 
 def linear(
@@ -1592,32 +1593,61 @@ class DSparkAttention(Attention):
             rows = torch.arange(bsz, device=main_x.device).view(bsz, 1).expand(bsz, seqlen)
             self.window_kv_cache[:bsz].index_put_((rows, positions % slots), main_kv)
 
-    def places_output(self) -> bool:
-        return False  # vxpu: the draft block's attention runs the published paths; the Block mixes the stream
-
-    def places_partial(self) -> bool:  # vxpu: the stream-mixing sum takes the main blocks' [b, s, hc, dim] stream
-        return False
-
     def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None, hc=None):
         """The draft block, x [bsz, block, dim], each row's at its own positions from start_pos
-        (vxpu: [bsz]); it reads the ring that observe wrote, and does not write it. (vxpu: x_in,
-        the quantized input the block's front may pass, is not used here; the published linears
-        quantize x themselves, to the same values.)"""
+        (vxpu: [bsz]); it reads the ring that observe wrote, and does not write it. vxpu: the
+        query, key and output paths run placed when the main attention's do (attn_q_fn,
+        window_kv_fn, attn_core_fn, attn_out_fn / attn_out_partial_fn with tp_allreduce_hc_fn):
+        the same values as the published path, in a kernel each instead of the norm, RoPE, quant
+        and copy kernels of the published one (hero run 15, the drafter's tail). What stays the
+        drafter's own is its selection: the ring's window followed by the whole block, every
+        query over all of it (get_dspark_topk_idxs), where the main attention's is causal."""
         bsz, block_size, _ = x.size()
         rd = self.rope_head_dim
-        freqs_cis = self.freqs_cis[_positions(start_pos, block_size, bsz, x.device)]
+        start = _start_rows(start_pos, bsz, x.device)
+        gathered = []
 
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-        kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
+        def freqs_cis():
+            if not gathered:
+                gathered.append(self.freqs_cis[_positions(start_pos, block_size, bsz, x.device)])
+            return gathered[0]
+        if (attn_q_fn is not None and self.wq_a.weight.dtype == torch.float8_e4m3fn
+                and self.wq_b.weight.dtype == torch.float8_e4m3fn):
+            qr, q = attn_q_fn(x if x_in is None else x_in, self.wq_a.weight, self.wq_a.scale, self.q_norm.weight,
+                              self.q_norm.eps, self.wq_b.weight, self.wq_b.scale, self.freqs_cis, start, block_size,
+                              self.n_local_heads, self.head_dim, rd, x_in is not None)
+            q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        else:
+            qr = self.q_norm(self.wq_a(x))
+            q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+            apply_rotary_emb(q[..., -rd:], freqs_cis())
+        if window_kv_fn is not None and self.wkv.weight.dtype == torch.float8_e4m3fn:
+            kv = window_kv_fn(x if x_in is None else x_in, self.wkv.weight, self.wkv.scale, self.kv_norm.weight,
+                              self.kv_norm.eps, self.freqs_cis, start, block_size, rd, x_in is not None)
+        else:
+            kv = self.kv_norm(self.wkv(x))
+            apply_rotary_emb(kv[..., -rd:], freqs_cis())
+            act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
 
         topk_idxs = get_dspark_topk_idxs(self.window_size, self.window_slots, bsz, block_size, start_pos, x.device)
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
+        if hc is not None and (self.places_output() or self.places_partial()):
+            residual, post, comb = hc
+            prepared = attn_core_fn is not None
+            if prepared:  # the attention finishes the output path's first step itself
+                o = attn_core_fn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale, self.freqs_cis, start, block_size, rd)
+            else:
+                o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            if self.places_partial():  # this rank's partial; the ranks' sum mixes the stream
+                part = attn_out_partial_fn(o, self.freqs_cis, start, block_size, self.wo_a.weight, self.wo_a.scale,
+                                           self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale,
+                                           rd, prepared).float()
+                return tp_allreduce_hc_fn(part, residual, post, comb)
+            return attn_out_fn(o, self.freqs_cis, start, block_size, self.wo_a.weight, self.wo_a.scale,
+                               self.n_local_groups, self.o_lora_rank, self.wo_b.weight, self.wo_b.scale, rd,
+                               residual, post, comb, prepared)
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        apply_rotary_emb(o[..., -rd:], freqs_cis(), True)
 
         o = o.view(bsz, block_size, self.n_local_groups, -1)
         act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)
@@ -1926,6 +1956,8 @@ def sample(logits, temperature: float = 1.0):
     """Gumbel-max trick: equivalent to multinomial sampling but faster on GPU,
     since it avoids the GPU-to-CPU sync in torch.multinomial."""
     if temperature == 0:
+        if argmax_fn is not None:  # vxpu: the library's reduction, not the compiler's one-program-per-row fusion
+            return argmax_fn(logits)
         return logits.argmax(dim=-1)
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)

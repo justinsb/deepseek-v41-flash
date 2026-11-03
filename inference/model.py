@@ -1851,15 +1851,44 @@ class Transformer(nn.Module):
         for layer in self.mtp:
             layer.attn.observe(main_x, start_pos)
 
-    def spec_draft(self, input_ids: torch.Tensor, start_pos):
+    def spec_draft(self, input_ids: torch.Tensor, start_pos, passes: int = 1):
         """Draft the tokens after input_ids [bsz], each row's next token, at its position start_pos
         (a decode position: an int, or [bsz]). Returns (output_ids [bsz, block + 1], input_ids
-        then the drafts; logits; confidence)."""
+        then the drafts; logits; confidence).
+
+        vxpu: with passes > 1, more blocks follow (hero run 15, the vLLM fork's sequential draft
+        passes): the stages' own hidden states at the block's positions, collapsed and doubled in
+        place of the two target layers', go into the rings for those positions (the verify writes
+        the target's over them later), and the next block starts from the last draft at its
+        position. Returns output_ids [bsz, passes * block + 1] (input_ids then every draft), the
+        logits of the first block, and the confidences [bsz, passes * block]. The rings' slack must
+        cover passes * block positions."""
         h = self.mtp[0].forward_embed(input_ids)
         pre_mix = make_identity_pre_mix(h, self.hc_mult)
         for layer in self.mtp:
             h, pre_mix = layer(h, start_pos, pre_mix)
-        return self.mtp[-1].forward_head(h, pre_mix, input_ids)
+        output_ids, logits, confidence = self.mtp[-1].forward_head(h, pre_mix, input_ids)
+        block = self.mtp[-1].block_size
+        ids, confs = [output_ids], [confidence]
+        for p in range(1, passes):
+            x = self.mtp[-1].hc_pre(h, pre_mix)  # [bsz, block, dim]: the stages' states at this block's positions
+            main_x = self.mtp[0].forward_main(torch.cat([x, x], dim=-1))
+            pos = _pos(start_pos, h.device, h.size(0)) + p * block - (block - 1)  # the block's first drafted position
+            for layer in self.mtp:
+                layer.attn.observe(main_x[:, 1:], pos)  # positions after the input token, before the next block
+            last = ids[-1][:, -1]
+            h = self.mtp[0].forward_embed(last)
+            pre_mix = make_identity_pre_mix(h, self.hc_mult)
+            start = _pos(start_pos, h.device, h.size(0)) + p * block
+            for layer in self.mtp:
+                h, pre_mix = layer(h, start, pre_mix)
+            more_ids, _, more_conf = self.mtp[-1].forward_head(h, pre_mix, last)
+            ids.append(more_ids[:, 1:])
+            confs.append(more_conf)
+        if passes > 1:
+            output_ids = torch.cat(ids, dim=1)
+            confidence = torch.cat(confs, dim=1)
+        return output_ids, logits, confidence
 
 
 def sample(logits, temperature: float = 1.0):

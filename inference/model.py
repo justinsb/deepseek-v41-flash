@@ -138,6 +138,7 @@ class ModelArgs:
     dspark_target_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
     dspark_head_fp8: bool = False  # vxpu: the drafter's own head in fp8 (32x32 block scales), not the shared bf16 one
+    dspark_markov_sharded: bool = False  # vxpu: the Markov head's table split by vocab across the ranks, each rank biasing and choosing over its quarter, a (value, index) pair exchanged a position (hero run 15)
     dspark_n_routed_experts: int = 0
     dspark_n_activated_experts: int = 0
 
@@ -1543,15 +1544,16 @@ class ParallelHead(nn.Module):
             # bf16 in the checkpoint, kept as fp32 here so the logits come out in fp32 directly
             self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
-    def forward(self, x: torch.Tensor, full_logits=False):
-        """x: [b, s, d]. Generation only needs the last position, so that is the default."""
+    def forward(self, x: torch.Tensor, full_logits=False, gather=True):
+        """x: [b, s, d]. Generation only needs the last position, so that is the default. vxpu: with
+        gather False the rank's own vocab slice comes back, not gathered (the sharded Markov head)."""
         if not full_logits:
             x = x[:, -1]
         if self.fp8:
             logits = linear(x.to(torch.bfloat16), self.weight, None, self.scale).float()
         else:
             logits = F.linear(x.float(), self.weight)
-        if world_size > 1:
+        if world_size > 1 and gather:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
@@ -1684,13 +1686,36 @@ class _ReplicatedHead(nn.Module):
         return (x.float().unsqueeze(-2) * self.weight.float()).sum(-1)
 
 
+class _ShardedMarkovHead(nn.Module):
+    """vxpu: the Markov head's table split by vocab rows across the ranks (this rank's quarter, bf16,
+    multiplied into an fp32 reduction as _ReplicatedHead does): the bias over the rank's slice of
+    the vocabulary, for the logits slice the head left ungathered. The rank's own choice is the
+    argmax over its slice; the ranks exchange a (value, index) pair a position and the first rank
+    holding the largest value wins, which is torch.argmax over the gathered vector (hero run 15: at
+    batch 8 the gathered logits were 20 MB a rank a call)."""
+
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.part_vocab_size = vocab_size // world_size
+        self.vocab_start_idx = rank * self.part_vocab_size
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, dim))
+
+    def forward(self, x: torch.Tensor, full_logits=False):
+        if not full_logits:
+            x = x[:, -1]
+        return (x.float().unsqueeze(-2) * self.weight.float()).sum(-1)
+
+
 class DSparkMarkovHead(nn.Module):
-    def __init__(self, vocab_size: int, dspark_markov_rank: int):
+    def __init__(self, vocab_size: int, dspark_markov_rank: int, sharded: bool = False):
         super().__init__()
         # vxpu: whole on every rank (33 MB tables): under tensor parallelism the parallel modules cost the
-        # drafter a gather and a sum per Markov step, five a call, more than the bytes they save (hero run 15)
+        # drafter a gather and a sum per Markov step, five a call, more than the bytes they save (hero run 15);
+        # sharded: the embedding whole, the head's table a quarter per rank and the choice exchanged as a pair
         self.embed = _ReplicatedEmbedding(vocab_size, dspark_markov_rank)
-        self.head = _ReplicatedHead(vocab_size, dspark_markov_rank)
+        self.sharded = bool(sharded and world_size > 1)
+        self.head = _ShardedMarkovHead(vocab_size, dspark_markov_rank) if self.sharded \
+            else _ReplicatedHead(vocab_size, dspark_markov_rank)
 
     def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         embed = self.embed(token_ids)
@@ -1726,7 +1751,7 @@ class DSparkBlock(Block):
             self.main_norm = RMSNorm(args.dim, args.norm_eps)
         if stage_id == args.n_mtp_layers - 1:
             self.norm = RMSNorm(args.dim, args.norm_eps)
-            self.markov_head = DSparkMarkovHead(args.vocab_size, args.dspark_markov_rank)
+            self.markov_head = DSparkMarkovHead(args.vocab_size, args.dspark_markov_rank, args.dspark_markov_sharded)
             self.confidence_head = DSparkConfidenceHead(args.dim + args.dspark_markov_rank)
         self.embed: ParallelEmbedding | None = None
         self.head: ParallelHead | None = None
@@ -1760,7 +1785,8 @@ class DSparkBlock(Block):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.head is not None
         x = self.hc_pre(x, pre_mix)
-        logits = (self.head8 if self.head8 is not None else self.head)(self.norm(x), full_logits=True)
+        sharded = self.markov_head.sharded  # vxpu: the logits stay the rank's vocab slice; the choice is exchanged
+        logits = (self.head8 if self.head8 is not None else self.head)(self.norm(x), full_logits=True, gather=not sharded)
         output_ids = input_ids.new_empty(input_ids.size(0), self.block_size + 1)
         output_ids[:, 0] = input_ids
         markov_embeds = []
@@ -1768,7 +1794,18 @@ class DSparkBlock(Block):
             logits_bias, markov_embed = self.markov_head(output_ids[:, i])
             logits[:, i].add_(logits_bias)
             markov_embeds.append(markov_embed)
-            output_ids[:, i + 1] = sample(logits[:, i], self.temperature)
+            if sharded:
+                assert self.temperature == 0, "the sharded Markov head chooses greedily"
+                local = argmax_fn(logits[:, i]) if argmax_fn is not None else logits[:, i].argmax(dim=-1)  # [b]
+                value = logits[:, i].gather(-1, local.unsqueeze(-1)).squeeze(-1)  # [b] fp32
+                pair = torch.stack([value, (local + self.markov_head.head.vocab_start_idx).to(value.dtype)], dim=-1)
+                pairs = [torch.empty_like(pair) for _ in range(world_size)]
+                dist.all_gather(pairs, pair)  # [world][b, 2]
+                stacked = torch.stack(pairs, dim=0)  # [world, b, 2]
+                best = stacked[..., 0].argmax(dim=0)  # the first rank with the largest value: the lowest index among ties
+                output_ids[:, i + 1] = stacked[best, torch.arange(best.size(0), device=best.device), 1].to(torch.long)
+            else:
+                output_ids[:, i + 1] = sample(logits[:, i], self.temperature)
         markov_embed = torch.stack(markov_embeds, dim=1)
         confidence = self.confidence_head(x, markov_embed)
         return output_ids, logits, confidence

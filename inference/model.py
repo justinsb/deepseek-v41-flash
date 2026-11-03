@@ -137,6 +137,7 @@ class ModelArgs:
     dspark_noise_token_id: int = 0
     dspark_target_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
+    dspark_head_fp8: bool = False  # vxpu: the drafter's own head in fp8 (32x32 block scales), not the shared bf16 one
     dspark_n_routed_experts: int = 0
     dspark_n_activated_experts: int = 0
 
@@ -1520,21 +1521,35 @@ class Block(nn.Module):
 
 
 class ParallelHead(nn.Module):
-    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6):
+    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6, fp8: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.part_vocab_size = vocab_size // world_size
-        # bf16 in the checkpoint, kept as fp32 here so the logits come out in fp32 directly
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
+        self.fp8 = fp8
+        if fp8:
+            # vxpu: the drafter's head in fp8 with the dense linears' 32x32 block scales, read at a
+            # quarter of the fp32 bytes; buffers without values, so the executor derives them from
+            # the checkpoint's bf16 head at load (hero run 15)
+            # (not persistent: the export then classifies them as derived, not as parameters to bind)
+            self.register_buffer("weight", torch.empty(self.part_vocab_size, self.dim, dtype=torch.float8_e4m3fn),
+                                 persistent=False)
+            self.register_buffer("scale", torch.empty(self.part_vocab_size // fp8_block_size, self.dim // fp8_block_size,
+                                                      dtype=torch.float8_e8m0fnu), persistent=False)
+        else:
+            # bf16 in the checkpoint, kept as fp32 here so the logits come out in fp32 directly
+            self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor, full_logits=False):
         """x: [b, s, d]. Generation only needs the last position, so that is the default."""
         if not full_logits:
             x = x[:, -1]
-        logits = F.linear(x.float(), self.weight)
+        if self.fp8:
+            logits = linear(x.to(torch.bfloat16), self.weight, None, self.scale).float()
+        else:
+            logits = F.linear(x.float(), self.weight)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
@@ -1652,6 +1667,7 @@ class DSparkBlock(Block):
             self.confidence_head = DSparkConfidenceHead(args.dim + args.dspark_markov_rank)
         self.embed: ParallelEmbedding | None = None
         self.head: ParallelHead | None = None
+        self.head8: ParallelHead | None = None  # vxpu: an fp8 head of the drafter's own (ModelArgs.dspark_head_fp8)
 
     def forward(self, x: torch.Tensor, start_pos, pre_mix: torch.Tensor):
         return super().forward(x, start_pos, pre_mix, None)  # drafts are text: no VL bias
@@ -1675,7 +1691,7 @@ class DSparkBlock(Block):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.head is not None
         x = self.hc_pre(x, pre_mix)
-        logits = self.head(self.norm(x), full_logits=True)
+        logits = (self.head8 if self.head8 is not None else self.head)(self.norm(x), full_logits=True)
         output_ids = input_ids.new_empty(input_ids.size(0), self.block_size + 1)
         output_ids[:, 0] = input_ids
         markov_embeds = []
@@ -1744,6 +1760,8 @@ class Transformer(nn.Module):
                 self.mtp.append(DSparkBlock(args.n_layers + layer_id, args))
                 self.mtp[-1].embed = self.embed
                 self.mtp[-1].head = self.head
+            if args.dspark_head_fp8:  # the drafter's own head in fp8 (vxpu), the target's stays as it is
+                self.mtp[-1].head8 = ParallelHead(args.vocab_size, args.dim, self.norm_eps, self.hc_eps, fp8=True)
         self.hc_mult = args.hc_mult
         self.vision = None
         if args.vision_enabled:

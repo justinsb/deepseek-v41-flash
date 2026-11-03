@@ -1638,16 +1638,20 @@ class _ReplicatedEmbedding(nn.Module):
 
 
 class _ReplicatedHead(nn.Module):
-    """vxpu: a head whole on every rank (ParallelHead's math, fp32 logits, no gather)."""
+    """vxpu: a head whole on every rank (ParallelHead's math, fp32 logits, no gather). The table
+    stays in the checkpoint's bf16 and the products accumulate in fp32: the same values ParallelHead
+    gets from its fp32 copy, at half the bytes. Written as a product and a sum so the compiler reads
+    the bf16 rows straight into the fp32 reduction (an fp32 copy of the table would cost more than
+    the read it saves; hero run 15: the Markov head reads this table once per drafted position)."""
 
     def __init__(self, vocab_size: int, dim: int):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.empty(vocab_size, dim))
 
     def forward(self, x: torch.Tensor, full_logits=False):
         if not full_logits:
             x = x[:, -1]
-        return F.linear(x.float(), self.weight)
+        return (x.float().unsqueeze(-2) * self.weight.float()).sum(-1)
 
 
 class DSparkMarkovHead(nn.Module):

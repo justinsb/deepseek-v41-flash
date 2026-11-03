@@ -1800,12 +1800,15 @@ class DSparkBlock(Block):
                 assert self.temperature == 0, "the sharded Markov head chooses greedily"
                 local = argmax_fn(logits[:, i]) if argmax_fn is not None else logits[:, i].argmax(dim=-1)  # [b]
                 value = logits[:, i].gather(-1, local.unsqueeze(-1)).squeeze(-1)  # [b] fp32
-                pair = torch.stack([value, (local + self.markov_head.head.vocab_start_idx).to(value.dtype)], dim=-1)
+                # the pair padded to four floats (16 bytes a row: the exchange's ring writes take aligned spans)
+                pair = torch.stack([value, (local + self.markov_head.head.vocab_start_idx).to(value.dtype),
+                                    torch.zeros_like(value), torch.zeros_like(value)], dim=-1)
                 pairs = [torch.empty_like(pair) for _ in range(world_size)]
-                dist.all_gather(pairs, pair)  # [world][b, 2]
-                stacked = torch.stack(pairs, dim=0)  # [world, b, 2]
+                dist.all_gather(pairs, pair)  # [world][b, 4]
+                stacked = torch.stack(pairs, dim=0)  # [world, b, 4]
                 best = stacked[..., 0].argmax(dim=0)  # the first rank with the largest value: the lowest index among ties
-                output_ids[:, i + 1] = stacked[best, torch.arange(best.size(0), device=best.device), 1].to(torch.long)
+                chosen = stacked[best, torch.arange(best.size(0), device=best.device), 1].to(torch.long)
+                output_ids[:, i + 1] = chosen.clamp_(0, self.markov_head.embed.weight.size(0) - 1)
             else:
                 output_ids[:, i + 1] = sample(logits[:, i], self.temperature)
         markov_embed = torch.stack(markov_embeds, dim=1)

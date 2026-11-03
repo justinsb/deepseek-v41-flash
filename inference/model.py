@@ -1786,7 +1786,9 @@ class DSparkBlock(Block):
         assert self.head is not None
         x = self.hc_pre(x, pre_mix)
         sharded = self.markov_head.sharded  # vxpu: the logits stay the rank's vocab slice; the choice is exchanged
-        logits = (self.head8 if self.head8 is not None else self.head)(self.norm(x), full_logits=True, gather=not sharded)
+        head = self.head8 if self.head8 is not None else self.head
+        # the keyword only on the sharded path: a head whose forward is replaced elsewhere need not know it
+        logits = head(self.norm(x), full_logits=True, gather=False) if sharded else head(self.norm(x), full_logits=True)
         output_ids = input_ids.new_empty(input_ids.size(0), self.block_size + 1)
         output_ids[:, 0] = input_ids
         markov_embeds = []

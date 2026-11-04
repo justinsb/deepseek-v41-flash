@@ -286,6 +286,69 @@ argmax_fn = None  # vxpu: argmax over the last dim outside the compiler's fusion
 # vxpu: the sharded Markov head's position as one kernel: markov_pick_fn(logits_slice [b, V/world] fp32, token [b],
 # markov table [vocab, D], head slice [V/world, D], vocab_start) -> (pair [b, 4] fp32, markov_embed [b, D])
 markov_pick_fn = None
+# vxpu: the attention over the two caches in the flat token-row form (see FlatRows): attn_select_rows_fn(q [t, 1, h, d],
+# window ring [cap, slots, d], compressed cache [cap, n2, d], attn_sink, compress_idxs [t, 1, t2], softmax_scale,
+# freqs table, pos [t], rows [t] (the cache row of each query row), newest [t], rope_dim, window) -> o as attn_select_fn's
+attn_select_rows_fn = None
+
+
+class FlatRows:
+    """vxpu: the flat token-row form of a decode step (hero run 15). The step's rows are tokens, not
+    sequences: row t is one token of sequence seq[t] at position pos[t], and every per-sequence state
+    (the window rings, the compressor's slots, the compressed cache, the indexer's keys, the n-gram
+    cache) is indexed by seq[t] where the rectangle form indexes it by the row. Rows run sorted by
+    (sequence, position), so a sequence's tokens of the step are consecutive and in order. The
+    forward runs with bsz = the token rows and seqlen = 1; `flat_rows` is set around it (the
+    exporter's FlatDecode) and None in the rectangle form."""
+
+    def __init__(self, seq: torch.Tensor, pos: torch.Tensor):
+        self.seq, self.pos = seq, pos
+        self._runs = {}
+
+    def _run_end(self, same: torch.Tensor) -> torch.Tensor:
+        """For every row the last row of its run, runs being maximal stretches of consecutive rows
+        with `same` (one shorter than the rows) true between neighbours. Static shapes: the run ids
+        by a cumulative sum, their last rows by a scatter max."""
+        n = self.seq.numel()
+        ar = torch.arange(n, device=self.seq.device)
+        first = torch.cat([torch.ones(1, dtype=torch.bool, device=self.seq.device), ~same])
+        run = first.to(torch.long).cumsum(0) - 1
+        ends = torch.zeros(n, dtype=torch.long, device=self.seq.device).scatter_reduce(0, run, ar, reduce="amax",
+                                                                                          include_self=False)
+        return ends[run]
+
+    def run_end(self, ratio: int) -> torch.Tensor:
+        """For every row the last row among its sequence's rows whose positions fall in the same group
+        of `ratio` positions (ratio 1: the row itself; 0: the whole sequence). The writes a group's
+        tokens share (the indexer's key, the compressed latent: the group's last token writes it, an
+        earlier one leaves the slot as it was) take the run's last row's value on every row, so the
+        duplicate indices of one index_put_ carry one value."""
+        if ratio not in self._runs:
+            same = self.seq[1:] == self.seq[:-1]
+            if ratio:
+                same = same & (self.pos[1:] // ratio == self.pos[:-1] // ratio)
+            self._runs[ratio] = self._run_end(same)
+        return self._runs[ratio]
+
+    @property
+    def newest(self) -> torch.Tensor:
+        """Every row's sequence's last position in this step (the window ring's newest slot)."""
+        return self.pos[self.run_end(0)]
+
+
+flat_rows: FlatRows | None = None
+
+
+def _rows(bsz: int, device) -> torch.Tensor:
+    """vxpu: the state row of each row of the step: the row itself, or its sequence in the flat
+    token-row form (FlatRows)."""
+    return flat_rows.seq if flat_rows is not None else torch.arange(bsz, device=device)
+
+
+def _state(buffer: torch.Tensor, bsz: int) -> torch.Tensor:
+    """vxpu: the rows of a per-sequence state buffer this step addresses: the first bsz, or the whole
+    buffer in the flat token-row form (its rows index it by sequence)."""
+    return buffer if flat_rows is not None else buffer[:bsz]
 
 
 def linear(
@@ -601,13 +664,15 @@ def _positions(start_pos, seqlen, bsz, device) -> torch.Tensor:
     return _pos(start_pos, device, bsz).view(bsz, 1) + torch.arange(seqlen, device=device)
 
 
-def get_window_topk_idxs(window_size: int, slots: int, bsz: int, seqlen, start_pos, device):
+def get_window_topk_idxs(window_size: int, slots: int, bsz: int, seqlen, start_pos, device, newest=None):
     """Which sliding-window cache slots each query attends to; -1 marks a slot holding nothing.
     The cache is a ring of `window_size` slots. Prefill needs one row per query, each seeing its own
     causal window. A decode step's queries see the ring, listed oldest first.
     Order within a row does not matter to `sparse_attn`, which handles every slot independently.
     (vxpu: every row has `window_size` entries so shapes are static; the published code cut the
-    prefill rows to min(seqlen, window_size). A -1 slot is exactly what a missing slot was.)
+    prefill rows to min(seqlen, window_size). A -1 slot is exactly what a missing slot was. `newest`
+    [bsz] gives each row's ring's newest position when it is not the row's own last position: the
+    flat token-row form, where the rows of one sequence share a ring.)
     """
     win = window_size
     if _is_prefill(start_pos):
@@ -621,7 +686,7 @@ def get_window_topk_idxs(window_size: int, slots: int, bsz: int, seqlen, start_p
     # `slots` positions, listed oldest first. A query sees those in its window: no later token of
     # the step, and no position before the sequence started.
     positions = _positions(start_pos, seqlen, bsz, device)  # [bsz, seqlen]
-    newest = positions[:, -1:]
+    newest = positions[:, -1:] if newest is None else newest.view(bsz, 1)
     k = torch.arange(slots, device=device)
     held = (newest - slots + 1 + k).unsqueeze(1)  # [bsz, 1, slots]: the positions, oldest first
     query = positions.unsqueeze(-1)
@@ -697,18 +762,22 @@ class Compressor(nn.Module):
         # decode: each row's tokens fill its slots in order, and a group is complete when a token
         # filled its last slot (vxpu: rows at different positions fill different slots; a step of
         # several tokens may complete a group partway, so the latent and readiness are per token)
+        # (the flat token-row form writes every token's slot first and pools after: a pooled group is
+        # only used by the token completing it, whose group's slots then all hold their tokens, and
+        # the step's later tokens of the sequence sit in other slots of the ring)
         start = _pos(start_pos, x.device, bsz)
-        rows = torch.arange(bsz, device=x.device)
+        rows = _rows(bsz, x.device)
+        kv_state, score_state = _state(self.kv_state, bsz), _state(self.score_state, bsz)
         latents, readies = [], []
         for t in range(seqlen):
             pos = start + t
-            self.kv_state[:bsz].index_put_((rows, pos % self.slots), kv[:, t])
-            self.score_state[:bsz].index_put_((rows, pos % self.slots), score[:, t])
+            kv_state.index_put_((rows, pos % self.slots), kv[:, t])
+            score_state.index_put_((rows, pos % self.slots), score[:, t])
             readies.append((pos + 1) % ratio == 0)
             # pool the current group's slots, in position order (as the slots were without slack)
             group = ((pos // ratio) * ratio).view(bsz, 1) + torch.arange(ratio, device=x.device)
             held = (rows.view(bsz, 1), group % self.slots)
-            latents.append((self.kv_state[held] * self.score_state[held].softmax(dim=1)).sum(dim=1))
+            latents.append((kv_state[held] * score_state[held].softmax(dim=1)).sum(dim=1))
         kv = torch.stack(latents, dim=1)
         return self.norm(kv.to(dtype)), torch.stack(readies, dim=1).view(bsz, seqlen, 1)
 
@@ -777,7 +846,8 @@ class Indexer(torch.nn.Module):
                 self.k_cache[:bsz].index_copy_(1, groups, k.to(self.k_cache.dtype))
             else:  # each row's own groups, token by token: a later token may complete the group
                 start = _pos(start_pos, device, bsz)
-                rows = torch.arange(bsz, device=device)
+                rows = _rows(bsz, device)
+                k_cache = _state(self.k_cache, bsz)
                 k_all = self.k_norm(self.wk(latent))
                 for t in range(seqlen):
                     groups = (start + t) // ratio
@@ -785,15 +855,18 @@ class Indexer(torch.nn.Module):
                     k = fp4_quant_dequant(_with_rotated_tail(k_all[:, t : t + 1], freqs, rd), fp4_block_size)
                     # an incomplete group leaves its slot as it was
                     done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
-                    k = torch.where(done, k, self.k_cache[rows, groups].unsqueeze(1))
-                    self.k_cache[:bsz].index_put_((rows, groups), k[:, 0].to(self.k_cache.dtype))
+                    k = torch.where(done, k, k_cache[rows, groups].unsqueeze(1))
+                    if flat_rows is not None and ratio > 1:  # a group's rows all write its last row's value
+                        k = k.index_select(0, flat_rows.run_end(ratio))
+                    k_cache.index_put_((rows, groups), k[:, 0].to(k_cache.dtype))
         if self.owns_k:
             shared_attn.index_k = self.k_cache
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
         apply_rotary_emb(q[..., -rd:], self.freqs_cis[_positions(start_pos, seqlen, bsz, device)])
         fp4_act_quant(q, fp4_block_size, True)
-        index_k = shared_attn.index_k[:bsz]
+        # (the flat token-row form gathers each row's sequence's keys: a copy of the key cache per token row)
+        index_k = shared_attn.index_k.index_select(0, flat_rows.seq) if flat_rows is not None else shared_attn.index_k[:bsz]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
@@ -964,11 +1037,14 @@ class Attention(nn.Module):
             window_kv = kv
         else:  # decode: each row's tokens into its ring buffer, then attend over the ring
             positions = _positions(start_pos, seqlen, bsz, x.device)
-            rows = torch.arange(bsz, device=x.device).view(bsz, 1).expand(bsz, seqlen)
-            self.window_kv_cache[:bsz].index_put_((rows, positions % slots), kv)
-            window_kv = self.window_kv_cache[:bsz]
-        if select_ids is False:  # vxpu: the placed attention forms the window's selection itself
-            return window_kv, None
+            rows = _rows(bsz, x.device).view(bsz, 1).expand(bsz, seqlen)
+            window_kv = _state(self.window_kv_cache, bsz)
+            window_kv.index_put_((rows, positions % slots), kv)
+        if select_ids is False:  # vxpu: the placed attention forms the window's selection itself (in the flat
+            return window_kv, None  # token-row form over the whole ring buffer, each row reading its sequence's)
+        if flat_rows is not None and not _is_prefill(start_pos):  # each row's sequence's ring, gathered
+            return window_kv.index_select(0, flat_rows.seq), get_window_topk_idxs(win, slots, bsz, seqlen, start_pos,
+                                                                                    x.device, newest=flat_rows.newest)
         return window_kv, get_window_topk_idxs(win, slots, bsz, seqlen, start_pos, x.device)
 
     def _compress_topk_idxs(self, x, qr, latent, ready, start_pos, offset):
@@ -1009,7 +1085,8 @@ class Attention(nn.Module):
                 self.compress_kv_cache[:bsz].index_copy_(1, groups, latent.to(self.compress_kv_cache.dtype))
             else:  # each row's own groups, token by token: a later token may complete the group
                 start = _pos(start_pos, device, bsz)
-                rows = torch.arange(bsz, device=device)
+                rows = _rows(bsz, device)
+                cache = _state(self.compress_kv_cache, bsz)
                 for t in range(seqlen):
                     groups = (start + t) // ratio
                     freqs = self.freqs_cis[(start + t + 1 - ratio).clamp_min(0)].unsqueeze(1)
@@ -1017,10 +1094,14 @@ class Attention(nn.Module):
                                             scale_dtype=torch.float8_e4m3fn)
                     # an incomplete group leaves its slot as it was
                     done = ready if ready.dim() == 0 else ready[:, t : t + 1]  # ratio 1: every token completes one
-                    out = torch.where(done, out, self.compress_kv_cache[rows, groups].unsqueeze(1))
-                    self.compress_kv_cache[:bsz].index_put_((rows, groups), out[:, 0].to(self.compress_kv_cache.dtype))
-        # read after the write, so this does not depend on the slice aliasing the cache
-        return shared_attn.compress_kv[:bsz], idxs
+                    out = torch.where(done, out, cache[rows, groups].unsqueeze(1))
+                    if flat_rows is not None and ratio > 1:  # a group's rows all write its last row's value
+                        out = out.index_select(0, flat_rows.run_end(ratio))
+                    cache.index_put_((rows, groups), out[:, 0].to(cache.dtype))
+        # read after the write, so this does not depend on the slice aliasing the cache (the flat token-row
+        # form returns the whole cache: the placed attention reads each row's sequence; the path computing
+        # here gathers it)
+        return _state(shared_attn.compress_kv, bsz), idxs
 
     def places_output(self) -> bool:
         """vxpu: whether the output path runs placed (attn_out_fn), in which case forward takes the
@@ -1071,10 +1152,14 @@ class Attention(nn.Module):
             if self.compress_ratio:  # offset 0: the compressed selection indexes the compressed cache itself
                 compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, 0)
             else:
-                compress_kv = kv.new_empty(bsz, 0, kv.size(-1))
+                compress_kv = kv.new_empty(kv.size(0), 0, kv.size(-1))
                 compress_idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
-            o = attn_select_fn(q, kv, compress_kv, self.attn_sink, compress_idxs, self.softmax_scale, self.freqs_cis,
-                               start, seqlen, rd, self.window_size, _is_prefill(start_pos))
+            if flat_rows is not None:  # the flat token-row form: the caches whole, each row reading its sequence's
+                o = attn_select_rows_fn(q, kv, compress_kv, self.attn_sink, compress_idxs, self.softmax_scale,
+                                        self.freqs_cis, start, flat_rows.seq, flat_rows.newest, rd, self.window_size)
+            else:
+                o = attn_select_fn(q, kv, compress_kv, self.attn_sink, compress_idxs, self.softmax_scale, self.freqs_cis,
+                                   start, seqlen, rd, self.window_size, _is_prefill(start_pos))
             if partial:  # this rank's heads and slices: a partial the ranks sum (in fp32, as RowParallelLinear
                 # does); the block mixes the stream
                 part = attn_out_partial_fn(o, self.freqs_cis, start, seqlen, self.wo_a.weight, self.wo_a.scale,
@@ -1091,6 +1176,8 @@ class Attention(nn.Module):
                                residual, post, comb, True)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
+            if flat_rows is not None:  # each row's sequence's compressed cache, gathered
+                compress_kv = compress_kv.index_select(0, flat_rows.seq)
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
         if self.places_output() and hc is not None:  # without hc (a caller of its own) the path below runs
@@ -1604,8 +1691,8 @@ class DSparkAttention(Attention):
             seed = main_kv.index_select(1, newest.clamp_min(0))
             self.window_kv_cache[:bsz].copy_(torch.where((newest >= 0).view(1, slots, 1), seed, 0.0))
         else:
-            rows = torch.arange(bsz, device=main_x.device).view(bsz, 1).expand(bsz, seqlen)
-            self.window_kv_cache[:bsz].index_put_((rows, positions % slots), main_kv)
+            rows = _rows(bsz, main_x.device).view(bsz, 1).expand(bsz, seqlen)
+            _state(self.window_kv_cache, bsz).index_put_((rows, positions % slots), main_kv)
 
     def forward(self, x: torch.Tensor, start_pos, x_in: torch.Tensor | None = None, hc=None):
         """The draft block, x [bsz, block, dim], each row's at its own positions from start_pos
@@ -1940,7 +2027,9 @@ class Transformer(nn.Module):
         image_mask = None if token_types is None else token_types >= 0  # TEXT is -1
         # image tokens take no part in an n-gram and get no engram contribution; text-only needs no mask
         engram_mask = None if image_mask is None else ~image_mask
-        engram_hashes = self.engram_hash(input_ids, start_pos, engram_mask) if self.engram_hash is not None else None
+        engram_hashes = (self.engram_hash(input_ids, start_pos, engram_mask,
+                                          rows=flat_rows.seq if flat_rows is not None else None)
+                         if self.engram_hash is not None else None)
         h = self.embed(input_ids)
         if images is not None:
             assert start_pos == 0, "image spans must be prefilled in a single chunk"

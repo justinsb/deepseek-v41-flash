@@ -158,10 +158,13 @@ class NgramHashState(nn.Module):
             "cache", torch.empty(args.max_batch_size, args.max_seq_len, dtype=torch.int64), persistent=False
         )
 
-    def forward(self, input_ids: torch.Tensor, start_pos, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, start_pos, token_mask: torch.Tensor | None = None,
+                rows: torch.Tensor | None = None) -> torch.Tensor:
         """token_mask: [B, L], False for tokens that take no part in an n-gram (image spans).
         Returns the hash ids, shaped [B, L, n_engram_layers, n_hash_cols].
-        (vxpu: start_pos is the int 0 for a prefill or a 0-d tensor for a decode step.)"""
+        (vxpu: start_pos is the int 0 for a prefill or a 0-d tensor for a decode step; `rows` [B]
+        gives each row's row of the token cache when it is not the row itself: the flat token-row
+        form, model.FlatRows, where the rows of one sequence share it.)"""
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         if token_mask is not None:
@@ -173,11 +176,14 @@ class NgramHashState(nn.Module):
         else:  # vxpu: each row at its own position (a single position applies to every row)
             start = torch.as_tensor(start_pos, device=input_ids.device, dtype=torch.long).reshape(-1)
             positions = start.expand(batch).view(batch, 1) + steps
-            rows = torch.arange(batch, device=input_ids.device).view(batch, 1).expand(batch, seqlen)
+            rows = (torch.arange(batch, device=input_ids.device) if rows is None else rows).view(batch, 1).expand(batch, seqlen)
             self.cache.index_put_((rows, positions), compressed)
         tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.layout.max_ngram_size):
-            source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
+            if rows is not None and rows.dim() == 2:  # each row's own cache row
+                source = self.cache[rows, (positions - shift).clamp_min(0)]
+            else:
+                source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, self.pad_id, source))
         tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram_size]

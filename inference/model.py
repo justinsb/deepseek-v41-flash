@@ -283,6 +283,9 @@ attn_out_partial_fn = None
 # attention and the MoE and skips its own hc_post.
 tp_allreduce_hc_fn = None
 argmax_fn = None  # vxpu: argmax over the last dim outside the compiler's fusion (sample at temperature 0)
+# vxpu: the sharded Markov head's position as one kernel: markov_pick_fn(logits_slice [b, V/world] fp32, token [b],
+# markov table [vocab, D], head slice [V/world, D], vocab_start) -> (pair [b, 4] fp32, markov_embed [b, D])
+markov_pick_fn = None
 
 
 def linear(
@@ -1802,6 +1805,20 @@ class DSparkBlock(Block):
         output_ids[:, 0] = input_ids
         markov_embeds = []
         for i in range(self.block_size):
+            if sharded and markov_pick_fn is not None:
+                # vxpu: the position's lookup, bias, add and local argmax as one kernel (hero run 15); the logits
+                # slice is not updated in place (the caller takes the tokens and the confidence, not the logits)
+                assert self.temperature == 0, "the sharded Markov head chooses greedily"
+                pair, markov_embed = markov_pick_fn(logits[:, i], output_ids[:, i], self.markov_head.embed.weight,
+                                                    self.markov_head.head.weight, self.markov_head.head.vocab_start_idx)
+                markov_embeds.append(markov_embed)
+                pairs = [torch.empty_like(pair) for _ in range(world_size)]
+                dist.all_gather(pairs, pair)  # [world][b, 4]
+                stacked = torch.stack(pairs, dim=0)  # [world, b, 4]
+                best = stacked[..., 0].argmax(dim=0)  # the first rank with the largest value: the lowest index among ties
+                chosen = stacked[best, torch.arange(best.size(0), device=best.device), 1].to(torch.long)
+                output_ids[:, i + 1] = chosen.clamp_(0, self.markov_head.embed.weight.size(0) - 1)
+                continue
             logits_bias, markov_embed = self.markov_head(output_ids[:, i])
             logits[:, i].add_(logits_bias)
             markov_embeds.append(markov_embed)

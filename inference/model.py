@@ -1982,13 +1982,25 @@ class Transformer(nn.Module):
         block = self.mtp[-1].block_size
         ids, confs = [output_ids], [confidence]
         for p in range(1, passes):
-            x = self.mtp[-1].hc_pre(h, pre_mix)  # [bsz, block, dim]: the stages' states at this block's positions
-            copies = self.mtp[0].main_proj.in_features // x.size(-1)  # one per target layer the projection takes
-            main_x = self.mtp[0].forward_main(torch.cat([x] * copies, dim=-1))
+            # the block before this one, as the next block's context (hero run 15): the stages run over its drafts
+            # but the last as a sequence at their positions, attending to the window as it stands, and their states
+            # (collapsed, doubled in place of the two target layers') go into the window for those positions. The
+            # first form observed the states of the block's own run, whose positions after the input token held
+            # the noise token: the next block then drafted without the drafted tokens' identities and its first
+            # draft agreed with the verify a quarter of the time against two thirds for the block before it.
+            prev = ids[-1][:, 1:]  # [bsz, block]: the drafts of the block before
             pos = _pos(start_pos, h.device, h.size(0)) + p * block - (block - 1)  # the block's first drafted position
-            for layer in self.mtp:
-                layer.attn.observe(main_x[:, 1:], pos)  # positions after the input token, before the next block
-            last = ids[-1][:, -1]
+            if block > 1:
+                hb = self.mtp[0].embed(prev[:, :-1]).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+                pm = make_identity_pre_mix(hb, self.hc_mult)
+                for layer in self.mtp:
+                    hb, pm = layer(hb, pos, pm)
+                x = self.mtp[-1].hc_pre(hb, pm)  # [bsz, block - 1, dim]
+                copies = self.mtp[0].main_proj.in_features // x.size(-1)  # one per target layer the projection takes
+                main_x = self.mtp[0].forward_main(torch.cat([x] * copies, dim=-1))
+                for layer in self.mtp:
+                    layer.attn.observe(main_x, pos)
+            last = prev[:, -1]
             h = self.mtp[0].forward_embed(last)
             pre_mix = make_identity_pre_mix(h, self.hc_mult)
             start = _pos(start_pos, h.device, h.size(0)) + p * block

@@ -6,6 +6,27 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
+import os as _os
+
+# vxpu: the drafter's confidence as the log-odds of its maximum probability at each block position (hero run 15;
+# the fork's acceptance estimator's feature) in place of the confidence head's score: VXPU_DRAFT_CONF=maxprob.
+_conf_maxprob = _os.environ.get("VXPU_DRAFT_CONF", "") == "maxprob"
+
+
+def _pair_with_lse(pair, logits_i, bias):
+    """The exchanged pair with the rank's log-sum-exp of the position's (biased) logits in its third float."""
+    z = logits_i.float() if bias is None else logits_i.float() + bias
+    lse = torch.logsumexp(z, dim=-1)
+    return torch.cat([pair[:, :2], lse.unsqueeze(-1).to(pair.dtype), pair[:, 3:]], dim=-1)
+
+
+def _maxprob_logodds(stacked):
+    """From the gathered pairs [world, b, 4]: the chosen token's logit (the max over the ranks' best values) less the
+    global log-sum-exp (over the ranks' partials) is log q(m*); returned as its log-odds, clamped to +-40."""
+    m = stacked[..., 0].max(dim=0).values
+    lse = torch.logsumexp(stacked[..., 2].float(), dim=0)
+    logq = (m.float() - lse).clamp(max=-1e-7)
+    return (logq - torch.log(-torch.expm1(logq))).clamp(-40.0, 40.0)
 import torch.nn.functional as F
 from engram import EngramLayout, NgramHashState
 from image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
@@ -1891,6 +1912,7 @@ class DSparkBlock(Block):
         output_ids = input_ids.new_empty(input_ids.size(0), self.block_size + 1)
         output_ids[:, 0] = input_ids
         markov_embeds = []
+        logodds = []
         for i in range(self.block_size):
             if sharded and markov_pick_fn is not None:
                 # vxpu: the position's lookup, bias, add and local argmax as one kernel (hero run 15); the logits
@@ -1899,9 +1921,14 @@ class DSparkBlock(Block):
                 pair, markov_embed = markov_pick_fn(logits[:, i], output_ids[:, i], self.markov_head.embed.weight,
                                                     self.markov_head.head.weight, self.markov_head.head.vocab_start_idx)
                 markov_embeds.append(markov_embed)
+                if _conf_maxprob:  # the kernel left the logits slice unbiased: the bias again for the partial
+                    _w = self.markov_head.head.weight
+                    pair = _pair_with_lse(pair, logits[:, i], markov_embed.float() @ _w.float().t())
                 pairs = [torch.empty_like(pair) for _ in range(world_size)]
                 dist.all_gather(pairs, pair)  # [world][b, 4]
                 stacked = torch.stack(pairs, dim=0)  # [world, b, 4]
+                if _conf_maxprob:
+                    logodds.append(_maxprob_logodds(stacked))
                 best = stacked[..., 0].argmax(dim=0)  # the first rank with the largest value: the lowest index among ties
                 chosen = stacked[best, torch.arange(best.size(0), device=best.device), 1].to(torch.long)
                 output_ids[:, i + 1] = chosen.clamp_(0, self.markov_head.embed.weight.size(0) - 1)
@@ -1916,16 +1943,23 @@ class DSparkBlock(Block):
                 # the pair padded to four floats (16 bytes a row: the exchange's ring writes take aligned spans)
                 pair = torch.stack([value, (local + self.markov_head.head.vocab_start_idx).to(value.dtype),
                                     torch.zeros_like(value), torch.zeros_like(value)], dim=-1)
+                if _conf_maxprob:  # the bias is in the slice already
+                    pair = _pair_with_lse(pair, logits[:, i], None)
                 pairs = [torch.empty_like(pair) for _ in range(world_size)]
                 dist.all_gather(pairs, pair)  # [world][b, 4]
                 stacked = torch.stack(pairs, dim=0)  # [world, b, 4]
+                if _conf_maxprob:
+                    logodds.append(_maxprob_logodds(stacked))
                 best = stacked[..., 0].argmax(dim=0)  # the first rank with the largest value: the lowest index among ties
                 chosen = stacked[best, torch.arange(best.size(0), device=best.device), 1].to(torch.long)
                 output_ids[:, i + 1] = chosen.clamp_(0, self.markov_head.embed.weight.size(0) - 1)
             else:
                 output_ids[:, i + 1] = sample(logits[:, i], self.temperature)
         markov_embed = torch.stack(markov_embeds, dim=1)
-        confidence = self.confidence_head(x, markov_embed)
+        if _conf_maxprob and logodds:
+            confidence = torch.stack(logodds, dim=1)  # [b, block]: the log-odds of each draft's maximum probability
+        else:
+            confidence = self.confidence_head(x, markov_embed)
         return output_ids, logits, confidence
 
 

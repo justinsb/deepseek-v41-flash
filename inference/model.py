@@ -190,6 +190,11 @@ linear_fn = None
 # grid, to [b, s, g, r] in place of dequantizing the whole weight and an einsum on every call.
 grouped_linear_fn = None
 
+# vxpu: the indexer's scoring and top-k placed elsewhere. When set and this
+# layer is not the candidate source, Indexer.forward calls index_topk_fn(...)
+# instead of computing einsum, relu, sum, and top-k locally.
+index_topk_fn = None
+
 
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, scale: torch.Tensor | None = None
@@ -655,16 +660,21 @@ class Indexer(torch.nn.Module):
         fp4_act_quant(q, fp4_block_size, True)
         index_k = shared_attn.index_k[:bsz]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q, index_k)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if world_size > 1:
-            dist.all_reduce(index_score)
         # how many compressed positions each query can see: a block becomes visible once the query
         # has passed its last token. One query per decode step, so there it is just a number.
         if prefill:
             compress_lens = (torch.arange(1, seqlen + 1, device=device) // ratio).unsqueeze(-1)
         else:
             compress_lens = ((_pos(start_pos, device) + 1) // ratio).view(1, 1)
+
+        if index_topk_fn is not None and not self.is_candidate_source:
+            candidates = shared_attn.candidates if self.uses_candidates else None
+            return index_topk_fn(q, index_k, weights, compress_lens.expand(bsz, seqlen, 1), candidates, self.index_topk, offset)
+
+        index_score = torch.einsum("bshd,btd->bsht", q, index_k)
+        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if world_size > 1:
+            dist.all_reduce(index_score)
         slots = torch.arange(index_k.size(1), device=device)
         index_score = index_score.masked_fill(slots >= compress_lens, -torch.inf)
         if self.is_candidate_source:
